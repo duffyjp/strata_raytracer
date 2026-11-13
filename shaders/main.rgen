@@ -10,6 +10,9 @@
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevel;
 layout(set = 0, binding = 1, rgba16f) uniform image2D hdrImage;
+// Feature images for the denoiser, at the trace target's resolution: 0 albedo, 1 normal, 2 depth.
+// Only written when CAM_FILTER.x is set, but always bound so the descriptor cannot be stale.
+layout(set = 0, binding = 6, rgba16f) uniform image2D gbufImage[3];
 
 layout(location = 0) rayPayloadEXT RayHit rayHit;
 layout(location = 1) rayPayloadEXT uint occludedFlag;
@@ -64,6 +67,9 @@ void main() {
     // the 1-sample-per-frame image that a moving camera otherwise shows.
     int spp = max(1, int(CAM_DISPLAY.z));
     vec3 sum = vec3(0.0);
+    vec4 fAlb = vec4(0.0), fNrm = vec4(0.0);
+    float fDepth = 1e5;
+    float fMat = 0.0;
     for (int s = 0; s < spp; ++s) {
         uint state = base + uint(s) * 7919u;
         state = pcgHash(state);  // pcgHash mutates its argument, so it needs a real variable
@@ -73,9 +79,40 @@ void main() {
                              + CAM_RIGHT.xyz * (ndc.x * CAM_RIGHT.w * tanHalf)
                              + CAM_UP.xyz * (ndc.y * tanHalf));
         sum += pathTrace(CAM_ORIGIN_FOV.xyz, dir, state);
+        if (s == 0) {
+            // One set of features per pixel, from the first sample. Averaging them across samples
+            // would soften exactly the edges the filter is supposed to protect, and the feature
+            // images only need to be good enough to decide what may be smoothed with what.
+            fAlb = vec4(gbAlbedo, gbHave ? 1.0 : 0.0);
+            fNrm = vec4(gbNormal, gbRough);
+            fDepth = gbPrimary ? gbDepth : 1e5;
+            fMat = gbMat + 1.0;
+        }
     }
 
-    vec3 prev = CAM_FRAME.z > 0.5 ? vec3(0.0) : imageLoad(hdrImage, ivec2(pixel)).rgb;
+    if (CAM_FILTER.x > 0.5) {
+        // Reciprocal depth: it fits comfortably in a half float, unlike a kilometre-far sky
+        // sentinel, and the filter's edge tests only ever compare depths relatively.
+        imageStore(gbufImage[0], ivec2(pixel), fAlb);
+        imageStore(gbufImage[1], ivec2(pixel), fNrm);
+        imageStore(gbufImage[2], ivec2(pixel),
+                   vec4(1.0 / (1.0 + fDepth), gbPrimary ? 1.0 : 0.0, fMat, 1.0));
+    }
+    // Channel view, so each feature can be inspected before anything downstream depends on it.
+    const int dbg = int(CAM_FILTER.y);
+    if (dbg == 1) { imageStore(hdrImage, ivec2(pixel), vec4(fAlb.rgb, fAlb.a)); return; }
+    if (dbg == 2) { imageStore(hdrImage, ivec2(pixel), vec4(fNrm.rgb * 0.5 + 0.5, fNrm.w)); return; }
+    if (dbg == 3) {
+        imageStore(hdrImage, ivec2(pixel), vec4(vec3(clamp(fDepth / 30.0, 0.0, 1.0)), 1.0));
+        return;
+    }
+
+    // A temporal filter and a progressive accumulator must not both average the same samples: the
+    // filter assumes each frame it is handed is an independent estimate, and pre-averaging makes
+    // its variance estimate read far too low, which shows up as over-blurring. So while filtering,
+    // each frame is written fresh and the history in the filter is the only memory.
+    const bool fresh = CAM_FRAME.z > 0.5 || CAM_FILTER.x > 0.5;
+    vec3 prev = fresh ? vec3(0.0) : imageLoad(hdrImage, ivec2(pixel)).rgb;
     // Store the mean, not the sum: what the image holds must not depend on how many samples went
     // into it. The present pass divides only by the number of accumulated frames, so a frame kept
     // from an earlier quality setting still displays at the brightness it was rendered with instead

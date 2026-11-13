@@ -885,19 +885,24 @@ void uploadFrameInstances(App* app, int slotIdx, const std::vector<CpuInstance>&
 
 // -------------------------------------------------------------------------------------------------
 void createDescriptorLayouts(App* app) {
-    VkShaderStageFlags stages = app->usingComputeFallback
-                                    ? VK_SHADER_STAGE_COMPUTE_BIT
-                                    : (VK_SHADER_STAGE_RAYGEN_BIT_KHR |
-                                       VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
-                                       VK_SHADER_STAGE_MISS_BIT_KHR);
+    VkShaderStageFlags stages =
+        VK_SHADER_STAGE_COMPUTE_BIT |   // the denoiser reads the scene block from this same set
+        (app->usingComputeFallback
+             ? VkShaderStageFlags(0)
+             : (VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+                VK_SHADER_STAGE_MISS_BIT_KHR));
 
-    VkDescriptorSetLayoutBinding b[6] = {};
-    const VkDescriptorType types[6] = {
+    VkDescriptorSetLayoutBinding b[7] = {};
+    const VkDescriptorType types[7] = {
         VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-        VK_DESCRIPTOR_TYPE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
-    const uint32_t counts[6] = {1, 1, 1, kMaxTextures, 1, 1};
-    for (int i = 0; i < 6; ++i) {
+        VK_DESCRIPTOR_TYPE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    // Binding 6 is the denoiser's feature array: albedo, normal, depth. It is always bound, even
+    // when denoising is off, because a descriptor holding a null view is only safe if nothing ever
+    // reads it - and "nothing ever reads it" is a claim about a uniform value, not the type system.
+    const uint32_t counts[7] = {1, 1, 1, kMaxTextures, 1, 1, 3};
+    for (int i = 0; i < 7; ++i) {
         b[i].binding = uint32_t(i);
         b[i].descriptorType = types[i];
         b[i].descriptorCount = counts[i];
@@ -905,11 +910,11 @@ void createDescriptorLayouts(App* app) {
     }
     VkDescriptorSetLayoutCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    ci.bindingCount = 6;
+    ci.bindingCount = 7;
     ci.pBindings = b;
     VK_CHECK(vkCreateDescriptorSetLayout(app->device, &ci, nullptr, &app->traceSetLayout));
 
-    VkDescriptorSetLayoutBinding pb[2] = {};
+    VkDescriptorSetLayoutBinding pb[3] = {};
     pb[0].binding = 0;
     pb[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     pb[0].descriptorCount = 1;
@@ -918,9 +923,13 @@ void createDescriptorLayouts(App* app) {
     pb[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     pb[1].descriptorCount = 1;
     pb[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pb[2].binding = 3;
+    pb[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    pb[2].descriptorCount = 1;
+    pb[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    pci.bindingCount = 2;
+    pci.bindingCount = 3;
     pci.pBindings = pb;
     VK_CHECK(vkCreateDescriptorSetLayout(app->device, &pci, nullptr, &app->presentSetLayout));
 
@@ -936,9 +945,77 @@ void createDescriptorLayouts(App* app) {
     pli.pSetLayouts = &app->presentSetLayout;
     VK_CHECK(vkCreatePipelineLayout(app->device, &pli, nullptr, &app->presentLayout));
 
+    // Denoiser set (descriptor set 1). Bindings 0..3 are this frame's inputs - noisy radiance and
+    // the three feature images - 4..6 the previous filtered state and 7..9 this frame's. All storage
+    // images, all resident in GENERAL, so no layout work is needed per frame; ordering is done with
+    // memory barriers at the dispatch.
+    VkDescriptorSetLayoutBinding db[10] = {};
+    for (int i = 0; i < 10; ++i) {
+        db[i].binding = uint32_t(i);
+        db[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        db[i].descriptorCount = 1;
+        db[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dci{};
+    dci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dci.bindingCount = 10;
+    dci.pBindings = db;
+    VK_CHECK(vkCreateDescriptorSetLayout(app->device, &dci, nullptr, &app->denSetLayout));
+
+    // Set 0 is reused from the trace pipeline so the filter can read the same scene block.
+    const VkDescriptorSetLayout denPipelineSets[2] = {app->traceSetLayout, app->denSetLayout};
+    VkPipelineLayoutCreateInfo dli{};
+    dli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    dli.setLayoutCount = 2;
+    dli.pSetLayouts = denPipelineSets;
+    VK_CHECK(vkCreatePipelineLayout(app->device, &dli, nullptr, &app->denLayout));
+
+    VkDescriptorPoolSize denPoolSizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 10 * kFramesInFlight}};
+    VkDescriptorPoolCreateInfo dpci2{};
+    dpci2.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci2.maxSets = kFramesInFlight;
+    dpci2.poolSizeCount = 1;
+    dpci2.pPoolSizes = denPoolSizes;
+    VK_CHECK(vkCreateDescriptorPool(app->device, &dpci2, nullptr, &app->denPool));
+
+    // Wavelet pass. Seven storage images (source colour and variance, the three feature images, the
+    // two outputs) plus a push constant block carrying the dilation step and the iteration flags.
+    VkDescriptorSetLayoutBinding ab[7] = {};
+    for (int i = 0; i < 7; ++i) {
+        ab[i].binding = uint32_t(i);
+        ab[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        ab[i].descriptorCount = 1;
+        ab[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo aci{};
+    aci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    aci.bindingCount = 7;
+    aci.pBindings = ab;
+    VK_CHECK(vkCreateDescriptorSetLayout(app->device, &aci, nullptr, &app->atrousSetLayout));
+
+    const VkDescriptorSetLayout atrousSets[2] = {app->traceSetLayout, app->atrousSetLayout};
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcr.size = 28;   // mode, step, first, last, then sigmaN, sigmaL, sigmaZ
+    VkPipelineLayoutCreateInfo ali{};
+    ali.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    ali.setLayoutCount = 2;
+    ali.pSetLayouts = atrousSets;
+    ali.pushConstantRangeCount = 1;
+    ali.pPushConstantRanges = &pcr;
+    VK_CHECK(vkCreatePipelineLayout(app->device, &ali, nullptr, &app->atrousLayout));
+
+    VkDescriptorPoolSize atrousPoolSizes[] = {
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7 * kFramesInFlight * 3}};
+    VkDescriptorPoolCreateInfo apci{};
+    apci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    apci.maxSets = kFramesInFlight * 3;
+    apci.poolSizeCount = 1;
+    apci.pPoolSizes = atrousPoolSizes;
+    VK_CHECK(vkCreateDescriptorPool(app->device, &apci, nullptr, &app->atrousPool));
     VkDescriptorPoolSize pool[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kFramesInFlight},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kFramesInFlight},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kFramesInFlight * 4},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kFramesInFlight * 2},
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kFramesInFlight * kMaxTextures},
         {VK_DESCRIPTOR_TYPE_SAMPLER, kFramesInFlight},
@@ -961,7 +1038,26 @@ void createDescriptorLayouts(App* app) {
         VK_CHECK(vkAllocateDescriptorSets(app->device, &dai, &app->traceSet[i]));
         dai.pSetLayouts = &app->presentSetLayout;
         VK_CHECK(vkAllocateDescriptorSets(app->device, &dai, &app->presentSet[i]));
+        dai.descriptorPool = app->denPool;
+        dai.pSetLayouts = &app->denSetLayout;
+        VK_CHECK(vkAllocateDescriptorSets(app->device, &dai, &app->denSet[i]));
+        dai.descriptorPool = app->atrousPool;
+        dai.descriptorSetCount = 3;
+        // An array of layouts, not the address of one: the driver reads descriptorSetCount
+        // handles from here, so pointing at a single member made it walk into the rest of the
+        // struct and fault before anything was rendered.
+        const VkDescriptorSetLayout atrousLayouts[3] = {app->atrousSetLayout, app->atrousSetLayout,
+                                                        app->atrousSetLayout};
+        dai.pSetLayouts = atrousLayouts;
+        VK_CHECK(vkAllocateDescriptorSets(app->device, &dai, app->atrousSet[i]));
     }
+}
+
+VkImageView featureView(App* app, int slotIdx, int c) {
+    // The feature images exist only while the denoiser or a feature view needs them. Binding the
+    // accumulation target in their place keeps every descriptor pointing at a real GENERAL image;
+    // the shader gates its writes on the same condition, so a placeholder is never touched.
+    return app->gbuf[slotIdx][c].view ? app->gbuf[slotIdx][c].view : app->hdr[slotIdx].view;
 }
 
 void writeTraceDescriptors(App* app, int slotIdx) {
@@ -977,6 +1073,12 @@ void writeTraceDescriptors(App* app, int slotIdx) {
     VkDescriptorImageInfo hdrInfo{};
     hdrInfo.imageView = app->hdr[slotIdx].view;
     hdrInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo gbufInfo[3];
+    for (int i = 0; i < 3; ++i) {
+        memset(&gbufInfo[i], 0, sizeof(gbufInfo[i]));
+        gbufInfo[i].imageView = featureView(app, slotIdx, i);
+        gbufInfo[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
     VkDescriptorImageInfo presentInfo{};
     // While a quality change is taking effect, show the previous complete frame rather than the
     // newly allocated (and not yet traced) target.
@@ -999,17 +1101,20 @@ void writeTraceDescriptors(App* app, int slotIdx) {
     asInfo.accelerationStructureCount = 1;
     asInfo.pAccelerationStructures = &app->tlas[slotIdx];
 
-    const void* extra[6] = {&asInfo, nullptr, nullptr, nullptr, nullptr, nullptr};
-    VkDescriptorType types[6] = {
+    const void* extra[7] = {&asInfo, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    VkDescriptorType types[7] = {
         VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-        VK_DESCRIPTOR_TYPE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
-    uint32_t counts[6] = {1, 1, 1, kMaxTextures, 1, 1};
-    const VkDescriptorImageInfo* imgPtrs[6] = {nullptr, &hdrInfo, nullptr, texInfos, &samplerInfo, nullptr};
-    const VkDescriptorBufferInfo* bufPtrs[6] = {nullptr, nullptr, &uboInfo, nullptr, nullptr, &xformInfo};
+        VK_DESCRIPTOR_TYPE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    uint32_t counts[7] = {1, 1, 1, kMaxTextures, 1, 1, 3};
+    const VkDescriptorImageInfo* imgPtrs[7] = {nullptr, &hdrInfo, nullptr, texInfos, &samplerInfo,
+                                               nullptr, gbufInfo};
+    const VkDescriptorBufferInfo* bufPtrs[7] = {nullptr, nullptr, &uboInfo, nullptr, nullptr,
+                                                &xformInfo, nullptr};
 
-    VkWriteDescriptorSet writes[6];
-    for (int i = 0; i < 6; ++i) {
+    VkWriteDescriptorSet writes[7];
+    for (int i = 0; i < 7; ++i) {
         memset(&writes[i], 0, sizeof(writes[i]));
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].pNext = extra[i];
@@ -1020,9 +1125,9 @@ void writeTraceDescriptors(App* app, int slotIdx) {
         writes[i].pImageInfo = imgPtrs[i];
         writes[i].pBufferInfo = bufPtrs[i];
     }
-    vkUpdateDescriptorSets(app->device, 6, writes, 0, nullptr);
+    vkUpdateDescriptorSets(app->device, 7, writes, 0, nullptr);
 
-    VkWriteDescriptorSet pw[2] = {};
+    VkWriteDescriptorSet pw[3] = {};
     pw[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     pw[0].dstSet = app->presentSet[slotIdx];
     pw[0].dstBinding = 0;
@@ -1035,5 +1140,86 @@ void writeTraceDescriptors(App* app, int slotIdx) {
     pw[1].descriptorCount = 1;
     pw[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     pw[1].pBufferInfo = &uboInfo;
-    vkUpdateDescriptorSets(app->device, 2, pw, 0, nullptr);
+    // The denoiser's filtered image, so the present pass can show it. Before the filter exists the
+    // binding points at the HDR target, which is a real sampled image in the layout the sampler
+    // expects - a descriptor is allowed to be unused but not to name nothing.
+    VkDescriptorImageInfo denPresentInfo{};
+    denPresentInfo.imageView = app->cfg.denoise ? app->denPP[slotIdx][1][0].view
+                                                : app->hdr[slotIdx].view;
+    denPresentInfo.sampler = app->sampler;
+    denPresentInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    pw[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    pw[2].dstSet = app->presentSet[slotIdx];
+    pw[2].dstBinding = 3;
+    pw[2].descriptorCount = 1;
+    pw[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    pw[2].pImageInfo = &denPresentInfo;
+    vkUpdateDescriptorSets(app->device, 3, pw, 0, nullptr);
+
+    // Denoiser set. Bindings 0..3 read this frame, 4..6 the history, 7..9 the outputs.
+    VkDescriptorImageInfo denImg[10];
+    const VkImageView denViews[10] = {
+        app->hdr[slotIdx].view,
+        app->gbuf[slotIdx][0].view,
+        app->gbuf[slotIdx][1].view,
+        app->gbuf[slotIdx][2].view,
+        app->cfg.denoise ? app->denHist[slotIdx][0].view : app->hdr[slotIdx].view,
+        app->cfg.denoise ? app->denHist[slotIdx][1].view : app->hdr[slotIdx].view,
+        app->cfg.denoise ? app->denHist[slotIdx][2].view : app->hdr[slotIdx].view,
+        app->cfg.denoise ? app->denOut[slotIdx][0].view : app->hdr[slotIdx].view,
+        app->cfg.denoise ? app->denOut[slotIdx][1].view : app->hdr[slotIdx].view,
+        app->cfg.denoise ? app->denOut[slotIdx][2].view : app->hdr[slotIdx].view};
+    for (int i = 0; i < 10; ++i) {
+        memset(&denImg[i], 0, sizeof(denImg[i]));
+        denImg[i].imageView = denViews[i];
+        denImg[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    VkWriteDescriptorSet dw[10];
+    for (int i = 0; i < 10; ++i) {
+        memset(&dw[i], 0, sizeof(dw[i]));
+        dw[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        dw[i].dstSet = app->denSet[slotIdx];
+        dw[i].dstBinding = uint32_t(i);
+        dw[i].descriptorCount = 1;
+        dw[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        dw[i].pImageInfo = &denImg[i];
+    }
+    vkUpdateDescriptorSets(app->device, 10, dw, 0, nullptr);
+
+    // Wavelet sets. Iteration 0 reads the temporal output and its moments; the others read each
+    // other's scratch. Five iterations across the three sets leave the result in denPP[slot][1][0].
+    {
+        const VkImageView hdrFallback = app->hdr[slotIdx].view;
+        const VkImageView srcCol[3] = {app->denOut[slotIdx][0].view, app->denPP[slotIdx][1][0].view,
+                                       app->denPP[slotIdx][0][0].view};
+        const VkImageView srcVar[3] = {app->denOut[slotIdx][1].view, app->denPP[slotIdx][1][1].view,
+                                       app->denPP[slotIdx][0][1].view};
+        const VkImageView dstCol[3] = {app->denPP[slotIdx][1][0].view, app->denPP[slotIdx][0][0].view,
+                                       app->denPP[slotIdx][1][0].view};
+        const VkImageView dstVar[3] = {app->denPP[slotIdx][1][1].view,
+                                       app->denPP[slotIdx][0][1].view,
+                                       app->denPP[slotIdx][1][1].view};
+        for (int k = 0; k < 3; ++k) {
+            const VkImageView views[7] = {
+                srcCol[k] ? srcCol[k] : hdrFallback, srcVar[k] ? srcVar[k] : hdrFallback,
+                featureView(app, slotIdx, 0), featureView(app, slotIdx, 1),
+                featureView(app, slotIdx, 2),
+                dstCol[k] ? dstCol[k] : hdrFallback, dstVar[k] ? dstVar[k] : hdrFallback};
+            VkDescriptorImageInfo info[7];
+            VkWriteDescriptorSet aw[7];
+            for (int i = 0; i < 7; ++i) {
+                memset(&info[i], 0, sizeof(info[i]));
+                info[i].imageView = views[i];
+                info[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                memset(&aw[i], 0, sizeof(aw[i]));
+                aw[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                aw[i].dstSet = app->atrousSet[slotIdx][k];
+                aw[i].dstBinding = uint32_t(i);
+                aw[i].descriptorCount = 1;
+                aw[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                aw[i].pImageInfo = &info[i];
+            }
+            vkUpdateDescriptorSets(app->device, 7, aw, 0, nullptr);
+        }
+    }
 }

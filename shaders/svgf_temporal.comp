@@ -1,0 +1,132 @@
+// svgf_temporal.comp - SVGF temporal reprojection and moment tracking (Schied et al. 2017).
+//
+// Reprojects the previous filtered frame onto this one, decides per pixel whether that history is
+// still about the same piece of the world, and blends with an exponential moving average whose
+// weight comes from a per-pixel history length. The first and second moments of demodulated
+// luminance are accumulated in the same pass because the spatial filter's edge-stopping threshold
+// is driven by their difference, and it needs that estimate at every scale.
+//
+// Everything downstream works in the *demodulated* domain - radiance divided by albedo - so the
+// filter smooths illumination without dragging surface colour across a texture boundary. It is
+// multiplied back at the end of the wavelet chain.
+#version 460 core
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_nonuniform_qualifier : require
+
+#include "sceneblock.glsl"
+
+layout(set = 1, binding = 0, rgba16f) uniform image2D uNoisy;      // this frame's radiance
+layout(set = 1, binding = 1, rgba16f) uniform image2D uAlbedo;     // rgb, w = feature found
+layout(set = 1, binding = 2, rgba16f) uniform image2D uNormal;     // rgb normal, w = roughness
+layout(set = 1, binding = 3, rgba16f) uniform image2D uDepth;      // x = 1/(1+t), y = hit, z = mat id
+layout(set = 1, binding = 4, rgba16f) uniform image2D uHistColor;  // in: previous filtered
+layout(set = 1, binding = 5, rgba16f) uniform image2D uHistMoments;  // in: mean Y, mean Y^2, n, valid
+layout(set = 1, binding = 6, rgba16f) uniform image2D uHistDepth;  // in: previous reciprocal depth
+layout(set = 1, binding = 7, rgba16f) uniform image2D uOutColor;   // out: filtered, demodulated
+layout(set = 1, binding = 8, rgba16f) uniform image2D uOutMoments;
+layout(set = 1, binding = 9, rgba16f) uniform image2D uOutDepth;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float LUM_EPS = 1e-3;   // below this the albedo carries no signal worth demodulating by
+
+float lum(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// A point's screen coordinates in another camera. Returns false when the point is behind it.
+bool project(vec3 p, out vec2 uv) {
+    vec3 v = p - CAM_PREV_ORIGIN.xyz;
+    float c = dot(v, CAM_PREV_FWD.xyz);
+    if (c <= 1e-4) return false;
+    float a = dot(v, CAM_PREV_RIGHT.xyz);
+    float b = dot(v, CAM_PREV_UP.xyz);
+    vec2 ndc = vec2((a / c) / (CAM_PREV_RIGHT.w * CAM_PREV_ORIGIN.w), (b / c) / CAM_PREV_ORIGIN.w);
+    uv = ndc * 0.5 + 0.5;
+    return all(greaterThanEqual(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = ivec2(uint(CAM_FRAME.x), uint(CAM_FRAME.y));
+    if (pixel.x >= res.x || pixel.y >= res.y) return;
+
+    vec4 al = imageLoad(uAlbedo, pixel);
+    vec4 nr = imageLoad(uNormal, pixel);
+    vec4 dp = imageLoad(uDepth, pixel);
+    vec3 radiance = imageLoad(uNoisy, pixel).rgb;
+
+    // The filter always writes something, even where it declines to filter, so the next stage never
+    // reads an untouched texel.
+    vec3 demod = radiance;
+    const bool canDemod = al.w > 0.5 && lum(al.rgb) > LUM_EPS;
+    if (canDemod) demod = radiance / al.rgb;
+
+    if (CAM_FRAME.z > 0.5) {
+        // A reset (resize, quality change, first frame): history at this resolution does not exist.
+        imageStore(uOutColor, pixel, vec4(demod, 1.0));
+        imageStore(uOutMoments, pixel, vec4(lum(demod), lum(demod) * lum(demod), 1.0, 1.0));
+        imageStore(uOutDepth, pixel, dp);
+        return;
+    }
+
+    vec3 worldPos = CAM_ORIGIN_FOV.xyz;
+    if (dp.y > 0.5) {
+        float t = 1.0 / max(dp.x, 1e-6) - 1.0;
+        vec2 ndc = ((vec2(pixel) + 0.5) / vec2(res)) * 2.0 - 1.0;
+        vec3 dir = normalize(CAM_FWD.xyz
+                             + CAM_RIGHT.xyz * (ndc.x * CAM_RIGHT.w * CAM_ORIGIN_FOV.w)
+                             + CAM_UP.xyz * (ndc.y * CAM_ORIGIN_FOV.w));
+        worldPos += dir * t;
+    }
+
+    vec4 hist = vec4(0.0);
+    vec4 histMom = vec4(0.0);
+    float histDepth = 0.0;
+    bool histValid = false;
+    vec2 uv;
+    if (CAM_PREV_FWD.w > 0.5 && dp.y > 0.5 && project(worldPos, uv)) {
+        ivec2 hp = ivec2(uv * vec2(res));
+        hp = clamp(hp, ivec2(0), res - ivec2(1));
+        hist = imageLoad(uHistColor, hp);
+        histMom = imageLoad(uHistMoments, hp);
+        histDepth = imageLoad(uHistDepth, hp).x;
+        histValid = histMom.w > 0.5;
+
+        // Two independent reasons the reprojected texel might not describe this surface any more.
+        //
+        // Material: two different objects reprojecting to the same pixel must not trade samples.
+        // Depth:  compared in the reciprocal domain. A plain relative tolerance is the conservative
+        //         choice here - the paper's local-plane gradient form is what keeps history alive at
+        //         grazing angles, and giving it up means surfaces seen edge-on fall back to the
+        //         current sample more often. That is a noisier image, not a wrong one.
+        //
+        // The paper also rejects on the shading normal, which is not implemented: it needs the
+        // *previous* frame's normals, and this pass keeps only depth and material in history. The
+        // consequence is that a thin surface moving in front of another at a similar depth can keep
+        // its history for a few frames. Restoring the test means one more history image.
+        const float zc = dp.x, zh = histDepth;
+        const bool depthOk = abs(zc - zh) <= 0.01 * max(zc, zh) + 1e-3;
+        const bool matOk = abs(dp.z - imageLoad(uHistDepth, hp).z) < 0.5;
+        histValid = histValid && depthOk && matOk;
+    }
+
+    // History length drives the blend: a long history gets a small weight for the new sample, which
+    // is what makes a static region converge, while the cap is what eventually forgets an orbiting
+    // light that this surface no longer sees. Geometry here never moves, so the cap is the only
+    // forgetting mechanism there is - it must not be raised carelessly.
+    const float nMax = max(2.0, CAM_FILTER.z);
+    const float nPrev = histValid ? max(1.0, histMom.z) : 0.0;
+    const float alpha = max(1.0 / (1.0 + nPrev), 1.0 / nMax);
+    const float n = min(nMax, alpha * nPrev + 1.0);
+
+    vec3 filtered = mix(histValid ? hist.rgb : demod, demod, alpha);
+    float y = lum(demod);
+    float yh = histValid ? histMom.x : y;
+    float y2h = histValid ? histMom.y : y * y;
+    float yMean = mix(yh, y, alpha);
+    float y2Mean = mix(y2h, y * y, alpha);
+    float variance = max(0.0, y2Mean - yMean * yMean);
+
+    imageStore(uOutColor, pixel, vec4(max(filtered, vec3(0.0)), 1.0));
+    imageStore(uOutMoments, pixel, vec4(yMean, y2Mean, n, 1.0));
+    imageStore(uOutDepth, pixel, dp);
+}

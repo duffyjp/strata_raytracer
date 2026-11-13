@@ -1,0 +1,209 @@
+// ---- begin svgf_atrous.comp ----
+// svgf_atrous.comp - one iteration of the SVGF a-trous wavelet filter (Schied et al. 2017).
+//
+// Five iterations with the sampling step doubling each time give a filter whose footprint is
+// 65x65 pixels while every pass stays O(1) per pixel. Each tap is weighted by the separable wavelet
+// kernel times three edge-stopping terms: geometric agreement in depth, agreement in shading normal,
+// and luminance agreement scaled by the local variance. The variance term is what makes the filter
+// adaptive - a flat, well-sampled region keeps its detail because its variance is small and any
+// difference looks like an edge, while a badly sampled region is smoothed hard because its variance
+// is large and the same difference looks like noise.
+//
+// Works on demodulated radiance. The final iteration multiplies albedo back in, which is where the
+// image regains its surface colour after being smoothed in illumination space.
+#version 460 core
+#extension GL_EXT_scalar_block_layout : enable
+
+// ---- begin sceneblock.glsl ----
+// sceneblock.glsl - the host <-> GPU contract. Mirrored byte-for-byte by SceneGpuData in
+// src/scene.h. std140 with vec4-only members means the C++ and GLSL layouts cannot drift.
+
+struct Material {
+    vec4 albedo;    // rgb, w = diffuse amount (unused for metal/glass)
+    vec4 emissive;  // rgb * strength
+    vec4 params;    // x = reflectivity, y = roughness, z = ior, w = texture scale
+    vec4 flags;     // x = model (0 lambert, 1 metal, 2 glass, 3 emissive), y = texture slot or -1
+};
+
+struct Light {
+    vec4 posRadius;  // xyz = centre, w = radius
+    vec4 color;      // rgb * intensity, w = on/off
+};
+
+layout(set = 0, binding = 2, std140) uniform SceneBlock {
+    vec4 camera[16];
+    Material materials[32];
+    Light lights[4];
+} scene;
+
+#define LIGHT_COUNT 4
+
+// camera[] contract (see GpuCamera in src/scene.h)
+#define CAM_ORIGIN_FOV scene.camera[0]   // xyz origin, w = tan(fovY/2)
+#define CAM_RIGHT      scene.camera[1]   // xyz right, w = aspect
+#define CAM_UP         scene.camera[2]   // xyz up
+#define CAM_FWD        scene.camera[3]   // xyz forward, w = max bounces
+#define CAM_FRAME      scene.camera[4]   // x = width, y = height, z = reset accumulation, w = time
+#define CAM_POST       scene.camera[5]   // x = exposure, y = frame index, z = radiance clamp, w = sky mode
+#define CAM_DISPLAY    scene.camera[6]   // x = samples accumulated for display, y = flipY
+#define CAM_SKY        scene.camera[7]   // xyz horizon colour
+// camera[8..11] hold the *previous* frame's basis, in the same layout as [0..3], so a temporal
+// filter can reproject without the shader having to know how the camera is animated. camera[11].w
+// is 1 when the previous frame is usable (the first frame after startup or a resize is not).
+#define CAM_PREV_ORIGIN scene.camera[8]   // xyz origin, w = tan(fovY/2)
+#define CAM_PREV_RIGHT  scene.camera[9]   // xyz right, w = aspect
+#define CAM_PREV_UP     scene.camera[10]  // xyz up
+#define CAM_PREV_FWD    scene.camera[11]  // xyz forward, w = previous frame valid
+// Denoiser control. .x enables the feature writes, .y selects what the screen shows while the
+// filter is being built (0 nothing, 1 albedo, 2 normal, 3 depth), .z the history cap.
+#define CAM_FILTER      scene.camera[12]
+#define GBUF_ALBEDO  scene.camera[13]     // rgb albedo of the feature surface, w = 1 if found
+#define GBUF_NORMAL  scene.camera[14]     // xyz shading normal, w = linear depth of first hit
+#define GBUF_DEPTH   scene.camera[15]     // x = first hit depth (1e5 for sky), yzw unused
+
+// Cull-mask channels for VkAccelerationStructureInstanceKHR.mask.
+#define OCCLUDER_MASK  1u
+#define LIGHT_MASK     2u
+#define ALL_MASK       255u
+
+// Primitive kinds, packed into instanceCustomIndex as (kind << 8) | materialIndex.
+#define KIND_SPHERE 0u
+#define KIND_CUBE   1u
+#define KIND_CONE   2u
+#define KIND_DISC   3u
+// ---- end sceneblock.glsl ----
+
+layout(set = 1, binding = 0, rgba16f) uniform image2D uColor;      // source, demodulated
+layout(set = 1, binding = 1, rgba16f) uniform image2D uVar;        // variance, or moments if first
+layout(set = 1, binding = 2, rgba16f) uniform image2D uAlbedo;
+layout(set = 1, binding = 3, rgba16f) uniform image2D uNormal;
+layout(set = 1, binding = 4, rgba16f) uniform image2D uDepth;      // x = 1/(1+t), y = hit, z = mat
+layout(set = 1, binding = 5, rgba16f) uniform image2D uOutColor;
+layout(set = 1, binding = 6, rgba16f) uniform image2D uOutVar;
+
+// step   - dilation of the 5-tap kernel for this iteration: 1, 2, 4, 8, 16
+// first  - 1 when uVar holds temporal moments rather than variance
+// last   - 1 on the final iteration, which multiplies albedo back in
+layout(push_constant) uniform Push {
+    // 0 filter, 1 write |out - in| so an effectively-identity pass shows as black, 2 write the
+    // source variance, which is the quantity the luminance threshold is scaled by.
+    int mode;
+    int step;
+    int first;
+    int last;
+    float sigmaN;
+    float sigmaL;
+    float sigmaZ;
+} pc;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Separable a-trous kernel. Sum is 1, so a flat region passes through unchanged apart from the
+// edge weights, which is the property that keeps the filter from darkening or brightening image.
+const float H[5] = float[5](1.0 / 16.0, 1.0 / 4.0, 3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0);
+
+float lum(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+vec3 normAt(ivec2 p) { return normalize(imageLoad(uNormal, p).rgb + vec3(1e-6)); }
+
+float depthAt(ivec2 p) { return imageLoad(uDepth, p).x; }
+
+// Variance of the pixel itself, in the form this iteration expects.
+float varAt(ivec2 p) {
+    vec4 m = imageLoad(uVar, p);
+    if (pc.first == 1) return max(0.0, m.y - m.x * m.x);   // E[Y^2] - E[Y]^2 of the temporal mean
+    return max(0.0, m.x);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = ivec2(uint(CAM_FRAME.x), uint(CAM_FRAME.y));
+    if (pixel.x >= res.x || pixel.y >= res.y) return;
+
+    const vec3 c0 = imageLoad(uColor, pixel).rgb;
+    if (pc.mode == 2) {
+        // Raw variance, unscaled by anything except the view: a black image here means the wavelet
+        // threshold is being multiplied by zero and no neighbour can ever be accepted.
+        imageStore(uOutColor, pixel, vec4(vec3(varAt(pixel) * 1000.0), 1.0));
+        imageStore(uOutVar, pixel, vec4(varAt(pixel), 0.0, 0.0, 1.0));
+        return;
+    }
+    const vec3 n0 = normAt(pixel);
+    const float z0 = depthAt(pixel);
+    const float v0 = varAt(pixel);
+    const float l0 = lum(c0);
+
+    // The luminance edge-stopping scale is set by a 3x3 blur of the variance, not the variance
+    // itself: a single noisy variance sample would otherwise decide the threshold for the whole
+    // neighbourhood around it. This is the centre pixel's scale, used for every tap.
+    float vBlur = 0.0;
+    {
+        const float G[9] = float[9](1.0, 2.0, 1.0, 2.0, 4.0, 2.0, 1.0, 2.0, 1.0);
+        float acc = 0.0, wsum = 0.0;
+        int i = 0;
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                ivec2 q = clamp(pixel + ivec2(dx, dy), ivec2(0), res - ivec2(1));
+                acc += G[i] * varAt(q);
+                wsum += G[i];
+                ++i;
+            }
+        vBlur = max(1e-6, acc / wsum);
+    }
+
+    // The heart of the algorithm. The threshold has to grow with the distance a tap reaches,
+    // because variance accumulates over that distance: two samples two pixels apart disagree by
+    // more than two samples a hundred pixels apart would, purely from noise. Without this the
+    // wide iterations stop blurring at all and the low-frequency blotches survive.
+    const float s = float(max(1, pc.step));
+    const float sigmaLEff = max(1e-6, pc.sigmaL * sqrt(4.0 * s * s * vBlur));
+
+    vec3 acc = vec3(0.0);
+    float wTotal = 0.0;
+    float varAcc = 0.0;    // propagated variance, summed as sum(h^2 w^2 V)
+    float wLin = 0.0;      // sum(h w), squared at the end
+
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            const float hw = H[dy + 2] * H[dx + 2];
+            ivec2 q = clamp(pixel + ivec2(dx, dy) * int(s), ivec2(0), res - ivec2(1));
+
+            const vec3 cq = imageLoad(uColor, q).rgb;
+            const float zq = depthAt(q);
+            const float vq = varAt(q);
+
+            // Depth weight in the reciprocal domain. Surfaces at very different distances are not
+            // allowed to smooth into each other, which is what keeps a foreground object from
+            // painting the background behind it.
+            const float wz = exp(-abs(z0 - zq) / max(1e-6, pc.sigmaZ));
+            // Normal weight: a sharp power makes it a near-binary test that only forgives surfaces
+            // facing almost the same way, so creases and silhouette edges survive the wide passes.
+            const float wn = pow(max(0.0, dot(n0, normAt(q))), max(1.0, pc.sigmaN));
+            // Luminance weight scaled by variance, as above.
+            const float wl = exp(-abs(l0 - lum(cq)) / (sigmaLEff + 1e-6));
+
+            const float w = hw * wz * wn * wl;
+            acc += w * cq;
+            wTotal += w;
+            varAcc += hw * hw * w * w * vq;
+            wLin += hw * w;
+        }
+    }
+
+    vec3 outc = acc / max(1e-6, wTotal);
+    const float outVar = varAcc / max(1e-8, wLin * wLin);
+
+    if (pc.last == 1) {
+        // Back to lit radiance. Pixels with no feature surface - sky, or a path that never reached
+        // a diffuse hit - were never demodulated, so they must not be multiplied either.
+        vec4 al = imageLoad(uAlbedo, pixel);
+        if (al.w > 0.5) outc *= al.rgb;
+    }
+
+    if (pc.mode == 1)
+        imageStore(uOutColor, pixel, vec4(abs(outc - c0), 1.0));
+    else
+        imageStore(uOutColor, pixel, vec4(max(outc, vec3(0.0)), 1.0));
+    imageStore(uOutVar, pixel, vec4(max(outVar, 0.0), 0.0, 0.0, 1.0));
+}
+// ---- end svgf_atrous.comp ----

@@ -21,6 +21,8 @@ STAGES = [
     ("present.vert", "kPresentVert"),
     ("present.frag", "kPresentFrag"),
     ("fallback.comp", "kFallbackComp"),
+    ("svgf_temporal.comp", "kSvgfTemporal"),
+    ("svgf_atrous.comp", "kSvgfAtrous"),
 ]
 
 INCLUDE_RE = re.compile(r'^\s*#include\s+"([^"]+)"\s*$')

@@ -193,8 +193,31 @@ vec3 directLighting(HitInfo h, Material m, vec3 wo, vec3 albedo, inout uint stat
     return accum;
 }
 
+// ---------- denoiser features --------------------------------------------------------------------
+// What the transport loop reports about the surface it shaded, for the temporal filter's edge tests.
+// Written through module-scope variables rather than extra out-parameters so the ray-query fallback
+// keeps tracing the exact same paths without a second copy of the loop.
+vec3 gbAlbedo = vec3(0.0);       // surface colour with lighting removed
+vec3 gbNormal = vec3(0.0);       // shading normal, oriented toward the incoming ray
+float gbDepth = 0.0;             // distance to the first surface the primary ray touched
+bool gbPrimary = false;          // the primary ray hit something at all
+bool gbHave = false;             // a diffuse/glossy feature surface was found
+float gbRough = 0.0;
+float gbMat = -1.0;             // material index of the primary hit, for the filter's validity test             // roughness of that surface
+
+void gbBegin() {
+    gbAlbedo = vec3(0.0);
+    gbNormal = vec3(0.0);
+    gbDepth = 0.0;
+    gbPrimary = false;
+    gbHave = false;
+    gbRough = 0.0;
+    gbMat = -1.0;
+}
+
 // ---------- the shared transport loop ------------------------------------------------------------
 vec3 pathTrace(vec3 origin, vec3 direction, uint state) {
+    gbBegin();
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
     int maxBounces = int(CAM_FWD.w);
@@ -239,6 +262,26 @@ vec3 pathTrace(vec3 origin, vec3 direction, uint state) {
             vec3 tex = sampleTexture(int(m.flags.y), uv);
             if (max(max(tex.r, tex.g), tex.b) <= 1e-4) tex = proceduralChecker(uv, m.params.w);
             albedo *= mix(vec3(1.0), tex, 0.85);
+        }
+
+        if (!gbPrimary) {
+            // Depth for the disocclusion test is the geometry the eye actually rests on, so it is
+            // the first hit, not the feature surface below.
+            gbPrimary = true;
+            gbDepth = h.t;            gbMat = float(h.material);
+        }
+        if (!gbHave) {
+            // A filter that smooths across a mirror sees the reflection of something else and calls
+            // it the mirror's colour, so the features have to be taken from the first surface that
+            // scatters diffusely - following delta (perfectly specular and refracting) paths instead
+            // of stopping at them. Emissive orbs report no features at all.
+            const bool delta = (model >= 1.5) || (model >= 0.5 && rough < 0.03);
+            if (!delta) {
+                gbHave = true;
+                gbAlbedo = clamp(albedo, vec3(0.0), vec3(1.0));
+                gbNormal = normalize(h.normal);
+                gbRough = rough;
+            }
         }
 
         radiance += clamp(throughput * directLighting(h, m, wo, albedo, state), vec3(0.0), vec3(clampV));

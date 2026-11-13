@@ -5,6 +5,7 @@
 #include "sceneblock.glsl"
 
 layout(set = 0, binding = 0) uniform sampler2D hdrTexture;
+layout(set = 0, binding = 3) uniform sampler2D denTexture;   // denoiser output, for comparison
 layout(location = 0) in vec2 vUv;
 layout(location = 0) out vec4 outColor;
 
@@ -48,6 +49,11 @@ void main() {
         radiance = textureLod(hdrTexture, uv, 0.0).rgb;
     }
     radiance /= samples;
+    if (CAM_FILTER.x > 0.5) {
+        // The denoiser's output is already a mean radiance, so it replaces the accumulated value
+        // rather than being divided by the frame count a second time.
+        radiance = textureLod(denTexture, uv, 0.0).rgb;
+    }
 
     radiance *= CAM_POST.x;                       // exposure, from scene.json
     vec3 colour = acesApprox(radiance);

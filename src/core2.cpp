@@ -31,6 +31,44 @@ static VkShaderModule createShaderModule(App* app, const uint32_t* code, size_t 
 }
 
 void createShaderModulesAndPipelines(App* app) {
+    // The temporal filter is a compute pipeline over the same scene block the rays use, so it shares
+    // set 0 and adds its own set 1. Built unconditionally: the images it binds are only allocated
+    // when denoising is on, and the pass is only dispatched then, but having the pipeline present at
+    // all times keeps the init order identical between the two modes.
+    {
+        VkShaderModule mod = createShaderModule(app, shaders::kSvgfTemporal,
+                                                shaders::kSvgfTemporalWords,
+                                                "shaders/svgf_temporal.spv");
+        VkComputePipelineCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
+        ci.stage.pName = "main";
+        ci.layout = app->denLayout;
+        VK_CHECK(vkCreateComputePipelines(app->device, app->pipelineCache, 1, &ci, nullptr,
+                                          &app->denPipeline));
+        vkDestroyShaderModule(app->device, mod, nullptr);
+    }
+
+    // Created once, here, where the layouts it depends on already exist: a bulk text replacement
+    // once put this block in every function that mentioned the fallback, and the copies that ran
+    // early built a pipeline around a null layout and took the process down with an access fault.
+    {
+        VkShaderModule mod = createShaderModule(app, shaders::kSvgfAtrous,
+                                                shaders::kSvgfAtrousWords, "shaders/svgf_atrous.spv");
+        VkComputePipelineCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
+        ci.stage.pName = "main";
+        ci.layout = app->atrousLayout;
+        VK_CHECK(vkCreateComputePipelines(app->device, app->pipelineCache, 1, &ci, nullptr,
+                                          &app->atrousPipeline));
+        vkDestroyShaderModule(app->device, mod, nullptr);
+    }
+
     if (app->usingComputeFallback) {
         VkShaderModule mod = createShaderModule(app, shaders::kFallbackComp,
                                                 shaders::kFallbackCompWords, "shaders/fallback.spv");
@@ -165,6 +203,8 @@ void recreateHdrTargets(App* app, uint32_t width, uint32_t height) {
     if (chosen == VK_FORMAT_UNDEFINED) fail("no HDR image format supports storage+sampled+transfer");
     app->hdrFormat = chosen;
 
+    if (app->verbose)
+        logMsg("  hdr targets recreated (%ux%u)\n", width, height);
     for (int i = 0; i < kFramesInFlight; ++i) {
         destroyImage(app, &app->hdr[i]);
         createImage(app, width, height, chosen,
@@ -172,10 +212,72 @@ void recreateHdrTargets(App* app, uint32_t width, uint32_t height) {
                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     VK_IMAGE_ASPECT_COLOR_BIT, &app->hdr[i]);
 
+        // Feature images share the HDR target's format and lifetime: they are only meaningful at the
+        // resolution the paths were traced at, so a resize or a quality change retires them together.
+        // Allocated only when something will read them. Allocating them unconditionally shifted
+        // every later allocation in the process, and the unfiltered render began alternating
+        // between two outputs about half a percent apart with nothing on the shading path changed.
+        const bool wantFeatures = app->cfg.denoise || app->cfg.filterDebug != 0;
+        for (int c = 0; c < (wantFeatures ? 3 : 0); ++c) {
+            destroyImage(app, &app->gbuf[i][c]);
+            createImage(app, width, height, chosen,
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        VK_IMAGE_ASPECT_COLOR_BIT, &app->gbuf[i][c]);
+        }
+
+        // Denoiser history and output targets. Recreated with the HDR target and, crucially, the
+        // per-slot "previous frame" flag is dropped here: history kept from the old resolution would
+        // otherwise be reprojected into a target of a different size, which is not stale data but
+        // wrong data, and shows up as smeared ghosts rather than as an obvious glitch.
+        if (app->cfg.denoise) {
+            for (int c = 0; c < 3; ++c) {
+                destroyImage(app, &app->denHist[i][c]);
+            if (c < 2) {
+                destroyImage(app, &app->denPP[i][0][c]);
+                destroyImage(app, &app->denPP[i][1][c]);
+            }
+                createImage(app, width, height, chosen,
+                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT, &app->denHist[i][c]);
+                destroyImage(app, &app->denOut[i][c]);
+                createImage(app, width, height, chosen,
+                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT, &app->denOut[i][c]);
+            }
+            for (int p = 0; p < 2; ++p)
+                for (int c = 0; c < 2; ++c) {
+                    destroyImage(app, &app->denPP[i][p][c]);
+                    createImage(app, width, height, chosen,
+                                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT, &app->denPP[i][p][c]);
+                }            app->prevCamSlotValid[i] = false;
+        }
+
         VkCommandBuffer cmd = beginOneTime(app);
         transitionImage(app, cmd, &app->hdr[i], VK_IMAGE_LAYOUT_GENERAL, 0,
                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+        for (int c = 0; c < (wantFeatures ? 3 : 0); ++c)
+            transitionImage(app, cmd, &app->gbuf[i][c], VK_IMAGE_LAYOUT_GENERAL, 0,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+        if (app->cfg.denoise) {
+            for (int c = 0; c < 3; ++c) {
+                transitionImage(app, cmd, &app->denHist[i][c], VK_IMAGE_LAYOUT_GENERAL, 0,
+                                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+                transitionImage(app, cmd, &app->denOut[i][c], VK_IMAGE_LAYOUT_GENERAL, 0,
+                                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+            }
+            for (int p = 0; p < 2; ++p)
+                for (int c = 0; c < 2; ++c)
+                    transitionImage(app, cmd, &app->denPP[i][p][c], VK_IMAGE_LAYOUT_GENERAL, 0,
+                                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_IMAGE_ASPECT_COLOR_BIT);        }
         VkClearColorValue zero{};
         VkImageSubresourceRange range{};
         range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -217,7 +319,7 @@ void computeInstances(App* app, float t, std::vector<CpuInstance>* out) {
 }
 
 void fillSceneData(App* app, SceneGpuData* d, float t, uint32_t w, uint32_t h, bool reset,
-                   int samplesForDisplay) {
+                   int samplesForDisplay, int slotIdx) {
     memset(d, 0, sizeof(*d));
     const CameraDef& C = app->cfg.camera;
 
@@ -292,6 +394,24 @@ void fillSceneData(App* app, SceneGpuData* d, float t, uint32_t w, uint32_t h, b
     d->camera[6] = V4(float(samplesForDisplay), 1.f, float(spp), ssaa);
     d->camera[7] = V4(app->cfg.skyColor[0], app->cfg.skyColor[1], app->cfg.skyColor[2], 0.f);
 
+    // Rows 8..11 carry the previous frame's basis to the GPU. It is the basis that was actually
+    // presented, after the orbit/free-camera blend, so reprojection is correct whichever camera the
+    // player is looking through - and it stays correct through a quality change, which resizes the
+    // target but does not move the camera.
+    d->camera[8] = app->prevCamSlot[slotIdx][0];
+    d->camera[9] = app->prevCamSlot[slotIdx][1];
+    d->camera[10] = app->prevCamSlot[slotIdx][2];
+    const V4& prevFwd = app->prevCamSlot[slotIdx][3];
+    d->camera[11] = V4(prevFwd.x, prevFwd.y, prevFwd.z,
+                       app->prevCamSlotValid[slotIdx] ? 1.f : 0.f);
+    d->camera[12] = V4((app->cfg.denoise || app->cfg.filterDebug) ? 1.f : 0.f,
+                       float(app->cfg.filterDebug), app->cfg.denoiseHistoryCap, 0.f);
+    app->prevCamSlot[slotIdx][0] = d->camera[0];
+    app->prevCamSlot[slotIdx][1] = d->camera[1];
+    app->prevCamSlot[slotIdx][2] = d->camera[2];
+    app->prevCamSlot[slotIdx][3] = d->camera[3];
+    app->prevCamSlotValid[slotIdx] = true;
+
     for (size_t i = 0; i < app->cfg.materials.size() && i < size_t(kMaxMaterials); ++i) {
         const MaterialDef& m = app->cfg.materials[i];
         V4* p = &d->material[i * 4];
@@ -330,7 +450,8 @@ void buildFrameCommand(App* app, int slotIdx, uint32_t imageIndex, bool includeP
 
     // 1. Per-frame scene data.
     SceneGpuData* sceneData = static_cast<SceneGpuData*>(app->sceneUbo[slotIdx].mapped);
-    fillSceneData(app, sceneData, t, app->hdrWidth, app->hdrHeight, reset, samplesForDisplay);
+    fillSceneData(app, sceneData, t, app->hdrWidth, app->hdrHeight, reset, samplesForDisplay,
+                  slotIdx);
 
     const uint32_t instBytes = uint32_t(instances.size() * sizeof(VkAccelerationStructureInstanceKHR));
     const uint32_t xformBytes = uint32_t(instances.size() * sizeof(GpuInstance));
@@ -392,7 +513,7 @@ void buildFrameCommand(App* app, int slotIdx, uint32_t imageIndex, bool includeP
         // accumulator is additionally zeroed explicitly from runCapture. Relying on the shader alone
         // left stale samples of earlier stills in the buffer (several exposures in one image).
 
-        if (app->usingComputeFallback) {
+    if (app->usingComputeFallback) {
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app->traceLayout, 0, 1,
                                     &app->traceSet[slotIdx], 0, nullptr);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app->tracePipeline);
@@ -426,6 +547,70 @@ void buildFrameCommand(App* app, int slotIdx, uint32_t imageIndex, bool includeP
         }
     }
 
+    // 3b. Temporal filter. The ray-query fallback does not write the feature images, so denoising is
+    // deliberately not run there rather than running on inputs that were never filled in.
+    if (app->cfg.denoise && !app->usingComputeFallback) {
+        memBarrier(cmd, traceStage, VK_ACCESS_SHADER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+        // Both sets must be bound: the layout reuses the trace set as set 0 so the filter can read the
+        // scene block from it. Binding only the filter set installs it in slot 0 instead, the
+        // shader then reads a garbage camera and every invocation leaves at its bounds test.
+        const VkDescriptorSet denSets[2] = {app->traceSet[slotIdx], app->denSet[slotIdx]};
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app->denLayout, 0, 2,
+                                denSets, 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app->denPipeline);
+        vkCmdDispatch(cmd, (app->hdrWidth + 7) / 8, (app->hdrHeight + 7) / 8, 1);
+        memBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        // The filtered state becomes this slot's history for the next frame it renders. A copy, not
+        // a ping-pong: alternating input and output would mean rewriting the descriptor sets every
+        // frame, and they are written only when the targets are created.
+        for (int c = 0; c < 3; ++c) {
+            VkImageCopy reg{};
+            reg.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            reg.srcSubresource.layerCount = 1;
+            reg.dstSubresource = reg.srcSubresource;
+            reg.extent.width = app->hdrWidth;
+            reg.extent.height = app->hdrHeight;
+            reg.extent.depth = 1;
+            vkCmdCopyImage(cmd, app->denOut[slotIdx][c].image, VK_IMAGE_LAYOUT_GENERAL,
+                           app->denHist[slotIdx][c].image, VK_IMAGE_LAYOUT_GENERAL, 1, &reg);
+        }
+        memBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        // Five wavelet iterations with the dilation doubling. The three descriptor sets cover every
+        // src/dst combination, so only the push constants change between them, and after the fifth
+        // the result is in denPP[slot][1][0] - the image present and capture read.
+        struct AtrousPush { int mode; int step; int first; int last; float sigmaN; float sigmaL; float sigmaZ; };
+        const int setOrder[5] = {0, 1, 2, 1, 2};
+        for (int it = 0; it < 5; ++it) {
+            AtrousPush apc{};
+            apc.mode = (it == 4 && app->cfg.filterDebug == 5) ? 1
+                     : (it == 0 && app->cfg.filterDebug == 6) ? 2 : 0;
+            apc.step = 1 << it;
+            apc.first = (it == 0) ? 1 : 0;
+            apc.last = (it == 4) ? 1 : 0;
+            // sigmaZ is in reciprocal-depth units, where a couple of hundredths already separates
+            // surfaces at very different distances. sigmaN is the paper's normal exponent; sigmaL
+            // scales against the variance-scaled denominator inside the shader.
+            apc.sigmaN = app->cfg.denoiseSigmaN;
+            apc.sigmaL = app->cfg.denoiseSigmaL;
+            apc.sigmaZ = app->cfg.denoiseSigmaZ;
+
+
+            const VkDescriptorSet twoSets[2] = {app->traceSet[slotIdx],
+                                                app->atrousSet[slotIdx][setOrder[it]]};
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app->atrousLayout, 0, 2,
+                                    twoSets, 0, nullptr);
+            vkCmdPushConstants(cmd, app->atrousLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               sizeof(apc), &apc);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app->atrousPipeline);
+            vkCmdDispatch(cmd, (app->hdrWidth + 7) / 8, (app->hdrHeight + 7) / 8, 1);
+            memBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+        }    }
+
     if (!includePresent) {
         if (app->timeQueries)
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, app->timeQueries,
@@ -440,6 +625,16 @@ void buildFrameCommand(App* app, int slotIdx, uint32_t imageIndex, bool includeP
     transitionImage(app, cmd, &app->hdr[slotIdx], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, traceStage,
                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+
+    // When the screen is asked to show the filter's output, that image is the one being sampled, so
+    // it needs the same read-only visit the HDR target makes, and must come back to GENERAL for the
+    // next frame's dispatch.
+    const bool showDenoised = app->cfg.denoise;
+    if (showDenoised)
+        transitionImage(app, cmd, &app->denPP[slotIdx][1][0], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                        VK_IMAGE_ASPECT_COLOR_BIT);
 
     VkRenderPassBeginInfo rp{};
     rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -467,6 +662,12 @@ void buildFrameCommand(App* app, int slotIdx, uint32_t imageIndex, bool includeP
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
 
+    if (showDenoised)
+        transitionImage(app, cmd, &app->denPP[slotIdx][1][0], VK_IMAGE_LAYOUT_GENERAL,
+                        VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+
     if (app->timeQueries)
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, app->timeQueries,
                             queryBase + 1);
@@ -484,6 +685,15 @@ void destroyApp(App* app) {
         destroyBuffer(app, &app->instanceDev[i]);
         destroyBuffer(app, &app->scratch[i]);
         destroyImage(app, &app->hdr[i]);
+        for (int c = 0; c < 3; ++c) {
+            destroyImage(app, &app->gbuf[i][c]);
+            destroyImage(app, &app->denHist[i][c]);
+            if (c < 2) {
+                destroyImage(app, &app->denPP[i][0][c]);
+                destroyImage(app, &app->denPP[i][1][c]);
+            }
+            destroyImage(app, &app->denOut[i][c]);
+        }
         destroyImage(app, &app->hold[i]);
         app->holdPending[i] = false;
         if (app->tlas[i]) { vkDestroyAccelerationStructureKHR(app->device, app->tlas[i], nullptr); app->tlas[i] = VK_NULL_HANDLE; }

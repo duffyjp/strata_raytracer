@@ -32,6 +32,14 @@ build\bin\raytracer.exe
 * The title bar shows the live frame rate, the window size, the size actually being traced, the
   samples per pixel and which backend is active - for example
   `1280x720 trace 2560x1440 - 12 spp`.
+* **N toggles the denoiser**, which is **on by default**. The title bar states the state - 
+  `(N) Denoise ON` or `(N) Denoise OFF` - so there is nothing to guess. Toggling rebuilds the
+  filter's targets on the spot and drops its history, so the first denoised frame after a toggle is
+  a fresh estimate; give it a second before judging. A press of N is also treated as final: the
+  quality controller stops second-guessing it.
+* **Stills are not denoised** unless `--denoise` is named explicitly. A still averages dozens of
+  frames into one clean image, and the filter works by assuming each frame is independent and
+  keeping its own history - the two are opposite jobs.
 * **Quality adapts itself to the GPU** (see below), so it holds 60 fps instead of rendering cheaply.
   On the machine it was built on that means tracing 2560x1440 with 11-12 samples per pixel for a
   1280x720 window, using about 12 ms of each 16.7 ms frame.
@@ -80,10 +88,64 @@ Options (all optional):
 | `--compute` | force the compute + ray-query fallback instead of the ray-tracing pipeline |
 | `--rt` | require the ray-tracing pipeline and fail if it is missing |
 | `--pak FILE` | load a specific asset archive |
+| `--denoise` | filter the image with SVGF. **On by default when rendering to the window**; press **N** at any time |
+| `--no-denoise` | start without it (stills are never filtered unless `--denoise` is named) |
+| `--gbuf NAME` | show a filter input or output instead of the render: `albedo`, `normal`, `depth`, `denoised`, `diff`, `variance` |
+| `--filter-z F` | depth edge stopping, default 0.02 (reciprocal-depth units) |
+| `--filter-n F` | normal edge stopping, default 128 |
+| `--filter-l F` | luminance edge stopping, default 24 |
 | `--autoexit S` | close the window by itself after S seconds (used by the automated smoke test) |
+| `--dump-accum N` | during `--capture`, also write the raw float target after accumulation frame N
+  (`-2` for every frame) as `<dir>\accum_NNN.bin`, for noise analysis |
+| `--test-toggle N` | toggle the denoiser after N rendered frames - the same code path the N key uses |
 | `--verbose` | extra logging, including a per-phase frame-time breakdown |
 | `--help` | usage |
 
+
+### Denoising
+
+The renderer denoises by default, so one sample per pixel can be enough. It is SVGF
+(Spatiotemporal Variance-Guided Filtering, Schied et al. 2017) written as ordinary GLSL compute passes:
+one temporal pass that reprojects the previous frame into this one and keeps a capped running average,
+then five a-trous wavelet iterations that widen 1, 2, 4, 8, 16 pixels, each weighted by how similar the
+neighbour is in depth, normal and brightness, and by how noisy each pixel is. The filter runs on the GPU
+like everything else, needs no third-party library, and ships inside the same executable.
+
+What it costs and what it buys, measured on the machine it was built on (RTX PRO 5000, 1280x720,
+error quoted as RMSE against a reference converged to 512 frames):
+
+| one sample per pixel, frames spent | accumulating | with `--denoise` |
+| --- | --- | --- |
+| 1 frame | 22.45 | **10.29** |
+| 4 frames | 16.14 | 10.03 |
+| 16 frames | 11.23 | about 10 |
+
+So one denoised frame is worth roughly eight accumulated ones, which is the whole point: a moving camera
+cannot wait for sixteen frames. The GPU cost, measured with the same timestamps the quality controller
+uses and averaged over steady-state frames in interleaved runs: **0.31 ms** tracing one sample per
+pixel at 1280x720 without the filter, **1.10 ms** with it, so the filter costs about **0.8 ms** there.
+It runs over trace pixels, so expect roughly four times that when the controller is supersampling at
+2x - that figure is expected rather than measured.
+
+It gives itself up when it has to. The frame budget is spent on resolution and samples first, and
+only when both are already at their floor and frames are still arriving late does the controller
+surrender the filter, because that is the one case where the fraction of a millisecond it costs is
+worth more than the image quality it adds. Pressing N at any point overrides the controller
+permanently. It is worth knowing, though, that the filter has two real limits. Past about one frame of budget the improvement stops -
+one denoised frame and sixteen score the same - which means the remaining error is systematic (the
+filter smooths detail away) rather than noise, and the fixes for that are a normal-history test and a
+direct/indirect split, neither of which is implemented yet. And the weights are tuned on this scene:
+the paper's own constants score 12.91 where these score 10.29, because a checkerboard floor has a flat
+normal and a hard colour edge, so the geometric tests have almost nothing to work with and the
+brightness term has to carry them. `--filter-z`, `--filter-n` and `--filter-l` let you retune for a
+different scene; `--gbuf` shows every input the filter sees, plus what it changed (`diff`) and how noisy
+it thinks it is (`variance`), which is how the weights were found.
+
+Deviations from the paper, all deliberate: motion is handled by reprojecting with the previous frame's
+camera basis rather than per-pixel motion vectors, because nothing in this scene moves except the
+camera; direct and indirect light are not separated into two channels, so the variance estimate is
+coarser than the paper's; and there is no second normal history, so a surface that swaps identity
+between frames without changing depth can keep its history for one frame too long.
 Everything it says also goes to `build\bin\raytracer.log`, because a GUI-subsystem program has no
 console when launched from Explorer.
 

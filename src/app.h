@@ -93,6 +93,38 @@ struct App {
     GpuBuffer sceneUbo[kFramesInFlight];
     GpuBuffer sbt;
     GpuImage hdr[kFramesInFlight];
+    // Denoiser feature targets, same lifetime and resolution as the HDR accumulation image:
+    // 0 = albedo (w: a feature surface was found), 1 = normal (w: roughness),
+    // 2 = reciprocal depth (y: the primary ray hit something, z: material index).
+    GpuImage gbuf[kFramesInFlight][3];
+    // The camera basis actually presented last frame, so reprojection works for the automated orbit
+    // and the free camera alike.
+    V4 prevCam[4] = {};
+    bool prevCamValid = false;
+    // SVGF temporal state. History belongs to a slot, not to the frame before: two frames are in
+    // flight and the loop only waits on its own slot's fence, so reading the other slot's output
+    // would be a race. A slot's own history was written two frames ago, which the fence does cover.
+    GpuImage denHist[kFramesInFlight][3];    // 0 colour, 1 moments, 2 depth + material
+    GpuImage denOut[kFramesInFlight][3];
+    // Wavelet scratch: iterations ping-pong between index 0 and 1, each holding filtered
+    // colour and the variance propagated with it. Five iterations from denOut land the result
+    // in index 1, which is what present and the capture read.
+    GpuImage denPP[kFramesInFlight][2][2];
+    V4 prevCamSlot[kFramesInFlight][4];
+    bool prevCamSlotValid[kFramesInFlight] = {};
+    // Denoiser plumbing, created only when denoising is enabled.
+    VkPipeline denPipeline = VK_NULL_HANDLE;
+    VkPipelineLayout denLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout denSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool denPool = VK_NULL_HANDLE;
+    VkDescriptorSet denSet[kFramesInFlight] = {};
+    // Wavelet pass: three sets per slot cover all five iterations, because the src/dst pair
+    // only takes three combinations while the iteration varies by push constant.
+    VkPipeline atrousPipeline = VK_NULL_HANDLE;
+    VkPipelineLayout atrousLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout atrousSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool atrousPool = VK_NULL_HANDLE;
+    VkDescriptorSet atrousSet[kFramesInFlight][3] = {};
     // The last complete image, kept alive across a quality change so the window never shows a
     // freshly cleared (blank) target: the next frame is traced into the new one while the screen
     // still displays this. A small hitch is preferable to a flash.
@@ -164,20 +196,31 @@ struct App {
     double gpuMsAvg = 0.0;          // smoothed full-frame GPU time at the current settings
     double cpuMsAvg = 0.0;          // smoothed real interval between frames: did we make vsync?
     int cleanPaceStreak = 0;        // consecutive frames that met the deadline
-    uint32_t lateFramesWindow = 0;  // frames since the last quality change that missed vsync
+    uint32_t lateFramesWindow = 0;  // frames since the last quality change that missed the target
     uint32_t framesWindow = 0;      // ...out of how many
-    // Histogram of frame intervals (1 ms bins) since the last quality change. The refresh period is
-    // the *most common* interval, not the shortest: a loop that sometimes runs twice per vsync makes
-    // the minimum useless, and the average hides the very thing being looked for - frames that
-    // arrive a whole vsync late. Both the period and the late fraction are read from this.
-    uint32_t dtBins[72] = {};
-    // The display's own cadence, learned from the shortest intervals observed. Asking for 120 fps on
-    // a 60 Hz panel must not read as "every frame is late", and a 16.7 ms average can hide half the
-    // frames arriving at 33 ms; measuring against the real refresh period handles both.
-    double paceFloorMs = 0.0;
     int overStreak = 0;             // consecutive decision windows over budget
     int underStreak = 0;            // ...and comfortably under it
+    int decideFrames = 0;           // readings since the controller last weighed anything
     double msPerSampleKiloPx = 0.0;  // smoothed unit cost, used to predict the next choice
+    // The cost model has two terms, because the work has two terms. Tracing costs per sample per
+    // traced pixel; the SVGF filter costs a fixed charge per traced pixel whatever the sample count
+    // is. Folding the second into the first is what made one setting read 0.7 ms at one moment and
+    // 11.2 ms at another - the filter's price was inside the per-sample constant whenever the filter
+    // was on and absent whenever it was not, so the constant moved by the filter's cost every time
+    // anyone pressed N.
+    double filterMsPerMegaPx = 0.86;   // ms the filter costs per megapixel traced
+    // That number can only be seen across a real flip at settings that did not change, so a flip
+    // arms a measurement which completes once the frame has settled again.
+    bool filterCalArmed = false;
+    bool filterCalTurningOn = false;
+    double filterCalBeforeMs = 0.0;
+    double filterCalMegaPx = 0.0;
+    float filterCalBeforeScale = 0.0f;
+    int filterCalBeforeSpp = 0;
+    int filterCalWait = 0;
+    int modelRejects = 0;             // readings refused as unsettled or as outliers
+    bool filterCalibrated = false;    // at least one two-sided measurement backs the constant
+    bool denoiseUserToggled = false;  // N was pressed: the user owns the switch for this run
     int liveSpp = 1;                // samples per pixel per frame in effect right now
     float liveScale = 1.0f;         // trace resolution scale in effect right now
     float userScaleCap = 1.0f;      // ceiling from --scale / scene.json; auto never exceeds it
@@ -189,6 +232,39 @@ struct App {
     int captureCount = 0;
     double autoExitSeconds = 0.0;  // >0: close the window by itself (lets the windowed path be tested)
     int captureAccum = 48;
+    // Debug only: dump the raw accumulation buffer, as floats, after this accumulation frame
+    // (-1 = never). Convergence was measured at half the rate independent samples should give, and
+    // aggregate statistics cannot tell whether consecutive frames repeat the same noise pattern or
+    // shift it; correlating the raw samples can.
+    int captureDumpFrame = -1;
+    // Debug only: toggle denoising after this many rendered frames, so the mid-run toggle can be
+    // exercised without a keyboard (-1 = never).
+    int testToggleFrame = -1;
+    // Debug only: after this many frames, force the condition the controller treats as 'the frame
+    // rate cannot be reached' - samples and resolution already at their floor, streak over budget -
+    // so the automatic decision can be exercised on a GPU that is comfortably fast enough.
+    int testGiveUpFrame = -1;
+    // Set along with it. The controller's condition for surrendering the filter is lateness against
+    // the frame rate the user asked for, and on a GPU that comfortably holds 60 fps there is no way
+    // to reach that state from inside a run, so this says the frames are late whether they are.
+    bool testLateForced = false;
+    // Debug only: replace the frame budget the controller works against (0 = leave it alone). The
+    // real budget has a 1.5 ms floor, so on a GPU that clears it easily there is no other way to
+    // reach the state where the frame rate genuinely cannot be held.
+    double testBudgetMs = 0.0;
+    // Consecutive readings in which frames arrived late or the GPU ran over budget. Feeds the
+    // decision to give up the denoiser, and deliberately separate from the controller's own streaks,
+    // which are reset whenever a reading falls inside the deadband.
+    int denoiseLateStreak = 0;
+    // Whether the frame just delivered missed the configured target. Measured against the target the
+    // user asked for, not against the most common frame interval: the histogram-based signal decides
+    // lateness relative to whatever cadence the loop has settled into, so a machine running at 24 fps
+    // for sixteen seconds reports itself perfectly on time.
+    bool lastFrameLate = false;
+    // Denoiser bookkeeping for the automatic decision: whether the controller (rather than the
+    // user) switched it off, and how many times it has been allowed to change its mind.
+    bool denoiseAutoOff = false;
+    int denoiseFlips = 0;
     std::string captureDir = "captures";
     uint32_t captureWidth = 1280, captureHeight = 720;
 };
@@ -225,8 +301,9 @@ void loadPakTextures(App* app);
 void createShaderModulesAndPipelines(App* app);
 void createDescriptorLayouts(App* app);
 void writeTraceDescriptors(App* app, int slotIdx);
+VkImageView featureView(App* app, int slotIdx, int c);
 void fillSceneData(App* app, SceneGpuData* d, float t, uint32_t w, uint32_t h, bool reset,
-                   int samplesForDisplay);
+                   int samplesForDisplay, int slotIdx);
 void computeInstances(App* app, float t, std::vector<CpuInstance>* out);
 void uploadFrameInstances(App* app, int slotIdx, const std::vector<CpuInstance>& inst);
 uint32_t sbtStrideFor(App* app);

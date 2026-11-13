@@ -25,6 +25,9 @@ struct RayHit {
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevel;
 layout(set = 0, binding = 1, rgba16f) uniform image2D hdrImage;
+// Feature images for the denoiser, at the trace target's resolution: 0 albedo, 1 normal, 2 depth.
+// Only written when CAM_FILTER.x is set, but always bound so the descriptor cannot be stale.
+layout(set = 0, binding = 6, rgba16f) uniform image2D gbufImage[3];
 
 layout(location = 0) rayPayloadEXT RayHit rayHit;
 layout(location = 1) rayPayloadEXT uint occludedFlag;
@@ -57,7 +60,7 @@ struct Light {
 };
 
 layout(set = 0, binding = 2, std140) uniform SceneBlock {
-    vec4 camera[8];
+    vec4 camera[16];
     Material materials[32];
     Light lights[4];
 } scene;
@@ -73,6 +76,19 @@ layout(set = 0, binding = 2, std140) uniform SceneBlock {
 #define CAM_POST       scene.camera[5]   // x = exposure, y = frame index, z = radiance clamp, w = sky mode
 #define CAM_DISPLAY    scene.camera[6]   // x = samples accumulated for display, y = flipY
 #define CAM_SKY        scene.camera[7]   // xyz horizon colour
+// camera[8..11] hold the *previous* frame's basis, in the same layout as [0..3], so a temporal
+// filter can reproject without the shader having to know how the camera is animated. camera[11].w
+// is 1 when the previous frame is usable (the first frame after startup or a resize is not).
+#define CAM_PREV_ORIGIN scene.camera[8]   // xyz origin, w = tan(fovY/2)
+#define CAM_PREV_RIGHT  scene.camera[9]   // xyz right, w = aspect
+#define CAM_PREV_UP     scene.camera[10]  // xyz up
+#define CAM_PREV_FWD    scene.camera[11]  // xyz forward, w = previous frame valid
+// Denoiser control. .x enables the feature writes, .y selects what the screen shows while the
+// filter is being built (0 nothing, 1 albedo, 2 normal, 3 depth), .z the history cap.
+#define CAM_FILTER      scene.camera[12]
+#define GBUF_ALBEDO  scene.camera[13]     // rgb albedo of the feature surface, w = 1 if found
+#define GBUF_NORMAL  scene.camera[14]     // xyz shading normal, w = linear depth of first hit
+#define GBUF_DEPTH   scene.camera[15]     // x = first hit depth (1e5 for sky), yzw unused
 
 // Cull-mask channels for VkAccelerationStructureInstanceKHR.mask.
 #define OCCLUDER_MASK  1u
@@ -357,8 +373,31 @@ vec3 directLighting(HitInfo h, Material m, vec3 wo, vec3 albedo, inout uint stat
     return accum;
 }
 
+// ---------- denoiser features --------------------------------------------------------------------
+// What the transport loop reports about the surface it shaded, for the temporal filter's edge tests.
+// Written through module-scope variables rather than extra out-parameters so the ray-query fallback
+// keeps tracing the exact same paths without a second copy of the loop.
+vec3 gbAlbedo = vec3(0.0);       // surface colour with lighting removed
+vec3 gbNormal = vec3(0.0);       // shading normal, oriented toward the incoming ray
+float gbDepth = 0.0;             // distance to the first surface the primary ray touched
+bool gbPrimary = false;          // the primary ray hit something at all
+bool gbHave = false;             // a diffuse/glossy feature surface was found
+float gbRough = 0.0;
+float gbMat = -1.0;             // material index of the primary hit, for the filter's validity test             // roughness of that surface
+
+void gbBegin() {
+    gbAlbedo = vec3(0.0);
+    gbNormal = vec3(0.0);
+    gbDepth = 0.0;
+    gbPrimary = false;
+    gbHave = false;
+    gbRough = 0.0;
+    gbMat = -1.0;
+}
+
 // ---------- the shared transport loop ------------------------------------------------------------
 vec3 pathTrace(vec3 origin, vec3 direction, uint state) {
+    gbBegin();
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
     int maxBounces = int(CAM_FWD.w);
@@ -403,6 +442,26 @@ vec3 pathTrace(vec3 origin, vec3 direction, uint state) {
             vec3 tex = sampleTexture(int(m.flags.y), uv);
             if (max(max(tex.r, tex.g), tex.b) <= 1e-4) tex = proceduralChecker(uv, m.params.w);
             albedo *= mix(vec3(1.0), tex, 0.85);
+        }
+
+        if (!gbPrimary) {
+            // Depth for the disocclusion test is the geometry the eye actually rests on, so it is
+            // the first hit, not the feature surface below.
+            gbPrimary = true;
+            gbDepth = h.t;            gbMat = float(h.material);
+        }
+        if (!gbHave) {
+            // A filter that smooths across a mirror sees the reflection of something else and calls
+            // it the mirror's colour, so the features have to be taken from the first surface that
+            // scatters diffusely - following delta (perfectly specular and refracting) paths instead
+            // of stopping at them. Emissive orbs report no features at all.
+            const bool delta = (model >= 1.5) || (model >= 0.5 && rough < 0.03);
+            if (!delta) {
+                gbHave = true;
+                gbAlbedo = clamp(albedo, vec3(0.0), vec3(1.0));
+                gbNormal = normalize(h.normal);
+                gbRough = rough;
+            }
         }
 
         radiance += clamp(throughput * directLighting(h, m, wo, albedo, state), vec3(0.0), vec3(clampV));
@@ -510,6 +569,9 @@ void main() {
     // the 1-sample-per-frame image that a moving camera otherwise shows.
     int spp = max(1, int(CAM_DISPLAY.z));
     vec3 sum = vec3(0.0);
+    vec4 fAlb = vec4(0.0), fNrm = vec4(0.0);
+    float fDepth = 1e5;
+    float fMat = 0.0;
     for (int s = 0; s < spp; ++s) {
         uint state = base + uint(s) * 7919u;
         state = pcgHash(state);  // pcgHash mutates its argument, so it needs a real variable
@@ -519,9 +581,40 @@ void main() {
                              + CAM_RIGHT.xyz * (ndc.x * CAM_RIGHT.w * tanHalf)
                              + CAM_UP.xyz * (ndc.y * tanHalf));
         sum += pathTrace(CAM_ORIGIN_FOV.xyz, dir, state);
+        if (s == 0) {
+            // One set of features per pixel, from the first sample. Averaging them across samples
+            // would soften exactly the edges the filter is supposed to protect, and the feature
+            // images only need to be good enough to decide what may be smoothed with what.
+            fAlb = vec4(gbAlbedo, gbHave ? 1.0 : 0.0);
+            fNrm = vec4(gbNormal, gbRough);
+            fDepth = gbPrimary ? gbDepth : 1e5;
+            fMat = gbMat + 1.0;
+        }
     }
 
-    vec3 prev = CAM_FRAME.z > 0.5 ? vec3(0.0) : imageLoad(hdrImage, ivec2(pixel)).rgb;
+    if (CAM_FILTER.x > 0.5) {
+        // Reciprocal depth: it fits comfortably in a half float, unlike a kilometre-far sky
+        // sentinel, and the filter's edge tests only ever compare depths relatively.
+        imageStore(gbufImage[0], ivec2(pixel), fAlb);
+        imageStore(gbufImage[1], ivec2(pixel), fNrm);
+        imageStore(gbufImage[2], ivec2(pixel),
+                   vec4(1.0 / (1.0 + fDepth), gbPrimary ? 1.0 : 0.0, fMat, 1.0));
+    }
+    // Channel view, so each feature can be inspected before anything downstream depends on it.
+    const int dbg = int(CAM_FILTER.y);
+    if (dbg == 1) { imageStore(hdrImage, ivec2(pixel), vec4(fAlb.rgb, fAlb.a)); return; }
+    if (dbg == 2) { imageStore(hdrImage, ivec2(pixel), vec4(fNrm.rgb * 0.5 + 0.5, fNrm.w)); return; }
+    if (dbg == 3) {
+        imageStore(hdrImage, ivec2(pixel), vec4(vec3(clamp(fDepth / 30.0, 0.0, 1.0)), 1.0));
+        return;
+    }
+
+    // A temporal filter and a progressive accumulator must not both average the same samples: the
+    // filter assumes each frame it is handed is an independent estimate, and pre-averaging makes
+    // its variance estimate read far too low, which shows up as over-blurring. So while filtering,
+    // each frame is written fresh and the history in the filter is the only memory.
+    const bool fresh = CAM_FRAME.z > 0.5 || CAM_FILTER.x > 0.5;
+    vec3 prev = fresh ? vec3(0.0) : imageLoad(hdrImage, ivec2(pixel)).rgb;
     // Store the mean, not the sum: what the image holds must not depend on how many samples went
     // into it. The present pass divides only by the number of accumulated frames, so a frame kept
     // from an earlier quality setting still displays at the brightness it was rendered with instead

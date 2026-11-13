@@ -264,11 +264,127 @@ void destroySwapchainObjects(App* app) {
 }
 
 // -------------------------------------------------------------------------------------------------
+// The filter is the first thing this controller gives up, and the last thing it takes back.
+//
+// It used to go last, on the theory that a clean image is worth more than a couple of milliseconds.
+// Measured on this machine that theory is wrong by an order of magnitude: at 3840x2100 a frame costs
+// 2.1 ms without the filter and 163 ms with it, so the choice is 58.8 fps or 5.6. The controller
+// never found that out, because its cost model had a single term for the whole frame and the
+// filter's price hid inside the per-sample constant, and because the escape hatch asked for forty
+// consecutive late readings - a streak the oscillation it was meant to cure restarted every time it
+// changed anything.
+//
+// So giving up the filter is no longer conditional on samples and resolution having already been
+// cut. Cutting them cannot pay for the filter anyway, and it spends the image to postpone the only
+// decision that works. What remains is the user's veto - see toggleDenoise - and a cap on how many
+// times the controller may change its mind.
+static const int kMaxDenoiseFlips = 3;
+// Consecutive late readings before the filter goes. Lateness means the frame arrived late against
+// the target the user asked for, so a machine running at 22 fps cannot report itself on time just
+// because 45 ms has become the most common frame interval.
+static const int kDenoiseGiveUpFrames = 8;
+
+// A frame needs several readings before it means anything: the timestamp query measures one command
+// buffer, and one command buffer can be slow because something else on the machine woke up.
+static const int kStaleFramesAfterChange = 3;  // measurements still reflecting the old settings
+// A quality change rebuilds the accumulation target, the three feature images, the filter's three
+// history images, its three output images and its wavelet scratch for both slots - some thirty
+// Vulkan allocations, measured at 20 to 140 ms of wall time. None of that is inside the timestamps,
+// but it lands on the frames straight afterwards, and a model learned from those describes the
+// allocator rather than the renderer. This is how many readings are thrown away for that reason.
+static const int kStaleFramesAfterRealloc = 6;
+static const int kAdjustEveryFrames = 12;      // weigh the evidence this many readings apart
+// Spending up leaves less than the whole budget on the table, because a climb that lands exactly on
+// the budget lands on top of the measurement noise too and the next reading then says it is over.
+static const double kClimbMargin = 0.86;
+static const double kDeadband = 0.72;          // between 72% and 104% of budget, change nothing
+// A flip's own cost is invisible from inside the frame it lands in, because the rebuild that comes
+// with it happens outside the timestamps. Its price is read this many frames later, once the
+// settings on both sides of it have been still for a while.
+static const int kFilterCalibFrames = 15;
+
 static void applyHdrSize(App* app, uint32_t swapW, uint32_t swapH) {
     float s = app->cfg.autoQuality ? app->liveScale : app->renderScale;
+    // Timed, because it is the one thing the controller must not learn from: this is where thirty
+    // Vulkan images are destroyed and rebuilt, none of it inside the GPU timestamps but all of it
+    // landing on the frames that follow. Recorded even when the caller times a wider window itself,
+    // so that a resize - which reaches here without going through the quality change paths - is
+    // accounted for too.
+    const double t0 = glfwGetTime();
     recreateHdrTargets(app, uint32_t(swapW * s), uint32_t(swapH * s));
     for (int i = 0; i < kFramesInFlight; ++i) writeTraceDescriptors(app, i);
     app->samplesAccumulated = 0;
+    const double cost = (glfwGetTime() - t0) * 1000.0;
+    app->lastChangeCostMs = cost;
+}
+
+// Turning the filter on or off mid-run is a size change in disguise: the feature images and the
+// filter's own history exist only while it is on, so the targets have to be rebuilt. What comes
+// back has no history and no accumulated samples, which is the right answer when the pipeline
+// underneath the image has just changed - the alternative is showing a blend of two different
+// filters as if it were one of them.
+// Megapixels the trace target covers right now - what the filter is charged against, since it runs
+// over the traced image rather than over the window.
+static double tracedMegaPx(const App* app) {
+    const double s = double(app->liveScale);
+    return double(app->swapExtent.width) * double(app->swapExtent.height) * s * s / 1.0e6;
+}
+
+// Turning the filter on or off mid-run is a size change in disguise: the feature images and the
+// filter's own history exist only while it is on, so the targets have to be rebuilt. What comes
+// back has no history and no accumulated samples, which is the right answer when the pipeline
+// underneath the image has just changed - the alternative is showing a blend of two different
+// filters as if it were one of them.
+static void setDenoiseEnabled(App* app, bool on, const char* why) {
+    if (app->usingComputeFallback || app->cfg.denoise == on) return;
+    // A flip is the one moment the filter's own cost can be seen: everything else about the frame
+    // stays exactly as it was, so the difference between a settled reading on one side and a settled
+    // reading on the other is the filter and nothing else. Take the first half of that measurement
+    // here, while the old state is still what the smoothed average describes.
+    //
+    // It only counts if the reading was actually settled. Sampling through an oscillation is how the
+    // constant used to be dragged to a value that described neither state.
+    app->filterCalArmed = false;
+    // Settled means past the readings that still describe the previous settings, not past the whole
+    // decision window: the emergency path that gives the filter up runs sooner than that, and a flip
+    // nobody measured is a flip whose cost has to be guessed at again next time.
+    if (app->timingSupported && app->settleFrames >= kStaleFramesAfterChange + 3 &&
+        app->gpuMsAvg > 0.0 && !app->resizePending) {
+        app->filterCalBeforeMs = app->gpuMsAvg;
+        app->filterCalMegaPx = tracedMegaPx(app);
+        app->filterCalBeforeScale = app->liveScale;
+        app->filterCalBeforeSpp = app->liveSpp;
+        app->filterCalTurningOn = on;
+        app->filterCalArmed = app->filterCalMegaPx > 1.0e-4;
+    }
+    app->cfg.denoise = on;
+    const double t0 = glfwGetTime();
+    vkDeviceWaitIdle(app->device);
+    applyHdrSize(app, app->swapExtent.width, app->swapExtent.height);
+    app->lastChangeCostMs = (glfwGetTime() - t0) * 1000.0;
+    // The rebuild is the reallocation the controller must not learn from: it spends tens of
+    // milliseconds making images that were never measured, and until it is done every reading
+    // describes a half-built frame.
+    invalidateQuality(app);
+    ++app->qualityChanges;
+    app->qualityChanged = true;
+    logMsg("denoise %s (%s)\n", on ? "ON" : "OFF", why);
+}
+
+static void toggleDenoise(App* app) {
+    if (app->usingComputeFallback) {
+        logMsg("denoise: unavailable on the ray-query fallback\n");
+        return;
+    }
+    // A press of N is a decision, not a suggestion: the controller is told to stop second-guessing
+    // it, otherwise a machine that cannot hold the frame rate would immediately switch the filter
+    // back off and the key would appear to do nothing. It is final for the rest of the run in both
+    // directions, so a user who turned the filter on deliberately cannot be argued with by a
+    // controller that has decided the frame is late.
+    app->denoiseAutoOff = false;
+    app->denoiseUserToggled = true;
+    app->denoiseFlips = kMaxDenoiseFlips;
+    setDenoiseEnabled(app, !app->cfg.denoise, "pressed N");
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -279,10 +395,8 @@ static void applyHdrSize(App* app, uint32_t swapW, uint32_t swapH) {
 // and cost is close to proportional to (pixels x samples per frame), which makes the next choice a
 // prediction rather than a guess. Resolution is held at the window size whenever one sample fits,
 // and the leftover budget goes into samples per pixel; the trace target only shrinks if a single
-// sample cannot make the frame.
-static const int kStaleFramesAfterChange = 3;  // measurements still reflecting the old settings
-static const int kAdjustEveryFrames = 12;      // re-decide about five times a second
-static const double kDeadband = 0.72;          // between 72% and 104% of budget, change nothing
+// sample cannot make the frame. That account is missing one line: the filter does not scale with the
+// sample count at all, so it is carried as its own term - see the cost model below.
 
 // What the display will actually deliver. Sizing the frame budget for 60 Hz when the panel runs at
 // 58 or 59 makes it slightly too big on every single frame: the number in the title bar still looks
@@ -332,11 +446,11 @@ void invalidateQuality(App* app) {
     // what lets the controller predict instead of relearning from scratch every time.
     app->gpuMsAvg = 0.0;
     app->settleFrames = 0;
+    app->decideFrames = 0;
     app->overStreak = 0;
     app->underStreak = 0;
     app->lateFramesWindow = 0;
     app->framesWindow = 0;
-    memset(app->dtBins, 0, sizeof(app->dtBins));
     app->qualityChanged = true;
 }
 
@@ -412,85 +526,218 @@ static void enterFreeCam(App* app) {
     logMsg("camera: free look (WASD to move, mouse to look; idle 10 s hands control back)\n");
 }
 
-void reportGpuFrameTime(App* app, double ms) {
-    if (!app->cfg.autoQuality || !app->timingSupported || ms <= 0.0) return;
-    if (app->settleFrames < kStaleFramesAfterChange) { ++app->settleFrames; return; }
+// What a frame would cost at a given trace scale and sample count, under the two-term model: the
+// trace pays per sample per traced pixel, and the filter pays per traced pixel whatever the sample
+// count is. kiloPx1 is the window's own size in kilopixels, so the traced area is kiloPx1*s*s.
+// Everything the controller decides is a comparison between one of these and the frame budget.
+struct CostModel {
+    double msPerSampleKiloPx = 0.00026;  // trace: ms per sample per traced kilopixel
+    double filterMsPerMegaPx = 0.86;     // filter: ms per traced megapixel
+    double kiloPx1 = 0.0;                // window kilopixels at scale 1.0
+    bool denoise = false;
 
+    double msAt(double scale, int spp) const {
+        const double area = kiloPx1 * scale * scale;               // kilopixels traced
+        double ms = msPerSampleKiloPx * area * double(std::max(1, spp));
+        if (denoise) ms += filterMsPerMegaPx * area / 1000.0;      // area/1000 = megapixels
+        return ms;
+    }
+    // The filter's share on its own, which is what has to come off a measurement before the
+    // per-sample constant is learned from it.
+    double filterOnly(double scale) const {
+        return denoise ? filterMsPerMegaPx * kiloPx1 * scale * scale / 1000.0 : 0.0;
+    }
+};
+
+void reportGpuFrameTime(App* app, double ms) {
+    if (!app->timingSupported || ms <= 0.0) return;
+
+    // A reading taken while the frame is still settling describes settings that are no longer in
+    // effect, and one taken just after a reallocation describes a frame that spent part of its time
+    // being built. Neither belongs in the average: that blending is exactly how the same setting came
+    // to read 0.7 ms at one moment and 11.2 ms at the next, and every prediction made from a number
+    // like that swings by the difference between them.
+    const int staleWanted = app->lastChangeCostMs > 25.0 ? kStaleFramesAfterRealloc
+                                                         : kStaleFramesAfterChange;
+    if (app->cfg.autoQuality && app->settleFrames < staleWanted) {
+        ++app->settleFrames;
+        return;
+    }
+    // The running average is the only readout of GPU cost, so it keeps updating even when adaptation
+    // is off. Gating it on autoQuality made every pinned-quality run report 0.0 ms, which is how a
+    // cost comparison came back looking like the filter was free.
     const double a = 0.2;
     app->gpuMsAvg = (app->gpuMsAvg <= 0.0) ? ms : (a * ms + (1.0 - a) * app->gpuMsAvg);
-    if (++app->settleFrames < kAdjustEveryFrames) return;
+    if (!app->cfg.autoQuality) return;
+    ++app->settleFrames;
+    ++app->decideFrames;
 
     const double frameMs = 1000.0 / effectiveFps(app->cfg);
-    // Read the display's cadence and the lateness from one histogram: the refresh period is the
-    // interval that occurs most often (smoothed over neighbouring milliseconds, since 16 and 17 ms
-    // are the same period), and a frame counts as late once it is past a third of a period beyond
-    // that. Frames arriving a whole vsync late are what the eye reads as stutter, and they are
-    // entirely invisible in an average frame rate.
-    uint32_t histTotal = 0, modeCount = 0, modeMs = 0;
-    for (uint32_t i = 2; i < 72; ++i) {
-        histTotal += app->dtBins[i];
-        const uint32_t pair = app->dtBins[i] + (i + 1 < 72 ? app->dtBins[i + 1] : 0);
-        if (pair > modeCount) { modeCount = pair; modeMs = i; }
-    }
-    // The budget is the requested frame period, never a measured one: the histogram is cleared at
-    // each change, so for its first frames the mode can be a short interval, which collapses the
-    // budget, cuts the sample count, then recovers and climbs again - a self-sustaining cycle at
-    // about the decision rate. The mode is therefore kept only as a diagnostic.
-    const double periodMs = frameMs;
-    (void)modeMs;
-    uint32_t lateCount = 0;
-    const uint32_t lateAbove = uint32_t(periodMs * 1.35);
-    if (modeCount >= 10)
-        for (uint32_t i = lateAbove; i < 72; ++i) lateCount += app->dtBins[i];
-    const double lateFrac = histTotal >= 30 ? double(lateCount) / double(histTotal) : 0.0;
     const double kCpuReserveMs = 2.5;  // the loop's own stages, which the GPU timestamp does not see
-    const double budget =
-        std::max(1.5, periodMs * (1.0 - double(app->cfg.qualityHeadroom)) - kCpuReserveMs);
-    // Watchdog. The command buffer can report that it fits while the display still misses vsync, so
-    // the real interval gets a vote too: aim lower until the pace recovers, and refuse to climb
-    // again until the pace has been clean for three quarters of a second - otherwise the two
-    // signals argue and the image flickers in quality.
-    // Blame the workload only when the GPU is also near its budget. Missing a 120 fps target on a
-    // 60 Hz panel is the display talking, and cutting quality for that would just give a worse
-    // picture at the same frame rate.
-    // Measured between the CPU loop's own iterations, "lateness" is not what the display shows: with
-    // the workload well under the refresh period the loop alternates short and long intervals while
-    // presents still land on vsync boundaries. So the histogram informs the target period, but does
-    // not drive quality decisions - the average frame time and the GPU's own measurement do.
-    const bool nearBudget = app->gpuMsAvg > kDeadband * budget;
-    const bool missingVsync = app->cpuMsAvg > periodMs * 1.10 && nearBudget;
-    if (missingVsync) app->cleanPaceStreak = 0; else ++app->cleanPaceStreak;
-    const double budgetUse = missingVsync ? budget * 0.85 : budget;
-    // Kilopixels the trace target would cover at scale 1.0 for this window.
+    double budget =
+        std::max(1.5, frameMs * (1.0 - double(app->cfg.qualityHeadroom)) - kCpuReserveMs);
+    if (app->testBudgetMs > 0.0) budget = app->testBudgetMs;
+
+    // ---- is this machine missing the frame rate it was asked for? --------------------------------
+    // Against the target the user set, never against the interval the loop happens to be delivering.
+    // The histogram this used to consult took the display period from the most common frame interval,
+    // so a renderer stuck at 22 fps found 45 ms to be the period, compared itself with 45 ms, and
+    // reported a late fraction of zero forever. The counts themselves live in the frame loop, where
+    // the interval is actually known: a frame that arrived late arrived late whatever its timestamps
+    // say, and the controller throws readings away while a change settles.
+    const bool lateNow = app->lastFrameLate || app->testLateForced;
+    if (lateNow) ++app->denoiseLateStreak; else app->denoiseLateStreak = 0;
+    const double lateFrac = app->framesWindow >= 12
+                                ? double(app->lateFramesWindow) / double(app->framesWindow)
+                                : 0.0;
+
+    // ---- price the filter, from a flip seen from both sides --------------------------------------
+    // One flip at settings that did not change is the only thing that separates the filter's cost from
+    // the trace's: on every other axis the frame is identical either side of it. The second reading is
+    // taken a while after the flip rather than in the frame the flip landed in, because that frame's
+    // numbers are about a rebuild of thirty images and not about the pipeline underneath it.
+    if (app->filterCalArmed) {
+        if (app->liveScale != app->filterCalBeforeScale || app->liveSpp != app->filterCalBeforeSpp) {
+            app->filterCalArmed = false;   // settings moved, so the two readings no longer describe
+                                           // the same frame and their difference means nothing
+        } else if (++app->filterCalWait >= kFilterCalibFrames) {
+            app->filterCalArmed = false;
+            const double delta = app->filterCalTurningOn ? app->gpuMsAvg - app->filterCalBeforeMs
+                                                         : app->filterCalBeforeMs - app->gpuMsAvg;
+            // Only a frame that got dearer when the filter went on, or cheaper when it went off, says
+            // anything about its price. Anything else means the readings were still settling.
+            if (delta > 0.0 && app->filterCalMegaPx > 1.0e-4) {
+                double perMega = delta / app->filterCalMegaPx;
+                // A first measurement replaces the seeded guess outright; after that one reading may
+                // not move the constant by more than a factor of two, so a single bad pair cannot
+                // reprice the filter out of existence.
+                if (app->filterCalibrated)
+                    perMega = std::min(std::max(perMega, app->filterMsPerMegaPx / 2.0),
+                                       app->filterMsPerMegaPx * 2.0);
+                perMega = std::min(std::max(perMega, 0.02), 80.0);
+                app->filterMsPerMegaPx = perMega;
+                app->filterCalibrated = true;
+                logMsg("  denoise cost: %.2f ms per megapixel traced (%.1f ms for %.2f MP, measured "
+                       "across the filter going %s)\n",
+                       app->filterMsPerMegaPx, app->filterMsPerMegaPx * app->filterCalMegaPx,
+                       app->filterCalMegaPx, app->filterCalTurningOn ? "on" : "off");
+            }
+        }
+    }
+
+    // ---- the model, and what it says about the frame just measured -------------------------------
     const double kiloPx1 =
         double(app->swapExtent.width) * double(app->swapExtent.height) / 1000.0;
     if (kiloPx1 <= 0.0 || app->liveSpp <= 0) return;
+    const double sNative = std::max(0.1, double(app->renderScale));
+    const double tracedKilo = kiloPx1 * double(app->liveScale) * double(app->liveScale);
+    CostModel model;
+    model.msPerSampleKiloPx = app->msPerSampleKiloPx;
+    model.filterMsPerMegaPx = app->filterMsPerMegaPx;
+    model.kiloPx1 = kiloPx1;
+    model.denoise = app->cfg.denoise;
 
-    const double scale2 = double(app->liveScale) * double(app->liveScale);
-    const double unit = app->gpuMsAvg / (kiloPx1 * double(app->liveSpp) * scale2);
-    app->msPerSampleKiloPx = (app->msPerSampleKiloPx <= 0.0)
-                                 ? unit
-                                 : (0.3 * unit + 0.7 * app->msPerSampleKiloPx);
+    // Learn the trace's own unit cost from the measurement with the filter's share taken out - the
+    // step that was missing, and the reason one constant had to stand in for two unrelated things.
+    const double traceMs = app->gpuMsAvg - model.filterOnly(app->liveScale);
+    // A reading the filter accounts for nearly all of says nothing about what tracing costs, and
+    // dividing by what is left would invent a unit cost out of the remainder. Those readings are
+    // refused rather than believed, and the refusal counted so it can be seen in the log.
+    if (traceMs > 0.15 * app->gpuMsAvg && tracedKilo > 0.0) {
+        double unit = traceMs / (tracedKilo * double(app->liveSpp));
+        if (app->msPerSampleKiloPx > 0.0) {
+            unit = std::min(std::max(unit, app->msPerSampleKiloPx / 2.0),
+                            app->msPerSampleKiloPx * 2.0);
+            app->msPerSampleKiloPx = 0.3 * unit + 0.7 * app->msPerSampleKiloPx;
+        } else {
+            app->msPerSampleKiloPx = unit;
+        }
+    } else {
+        ++app->modelRejects;
+    }
     if (app->msPerSampleKiloPx <= 1e-9) return;
+    model.msPerSampleKiloPx = app->msPerSampleKiloPx;
 
+    // ---- 1. the filter is the first thing given up -----------------------------------------------
+    // Before any reduction of resolution below the window's own size, and before any cut in samples,
+    // because where it hurts nothing else can pay for it: at 3840x2100 the filter costs more than the
+    // rest of the frame put together, so cutting pixels to make room for it throws away the image and
+    // still misses the frame. The streak is short and nothing the controller does restarts it, which
+    // is the whole reason it now fires: the version this replaces asked for forty consecutive late
+    // readings at the quality floor and reset its own count every time it changed anything, so on a
+    // machine that was oscillating it could never arrive anywhere. A frame that costs more than three
+    // times the budget is not a borderline case, and every further frame spent measuring it is a
+    // frame watched at a fraction of the frame rate, so that shortcut needs only two late readings.
+    const bool filterIsOursToGive = app->cfg.denoise && !app->denoiseUserToggled &&
+                                    app->denoiseFlips < kMaxDenoiseFlips;
+    // The cost gate is here so the filter is not sacrificed on a machine whose GPU cost is nowhere
+    // near the frame budget - a late frame there is something else on the system. --test-give-up
+    // means the opposite of that on purpose: it says to treat the run as missing its target
+    // whatever the numbers, so it overrides the gate as well as the lateness.
+    if (filterIsOursToGive && (app->testLateForced || app->gpuMsAvg > budget * 1.04)) {
+        const bool gross = app->gpuMsAvg > budget * 3.0 && app->denoiseLateStreak >= 2;
+        if (gross || lateFrac >= 0.25 || app->denoiseLateStreak >= kDenoiseGiveUpFrames) {
+            logMsg("quality decision: denoise off (late fraction %.2f, scale %.2f, spp %d)\n",
+                   lateFrac, double(app->liveScale), app->liveSpp);
+            app->denoiseAutoOff = true;
+            ++app->denoiseFlips;
+            setDenoiseEnabled(app, false, "frames late: the filter is the first thing given up");
+            return;
+        }
+    }
+    // While the filter is still ours to give up, the controller may spend spare budget but may not
+    // hand any of it back. Ordering is the whole point: if the frame is being missed and the filter
+    // is on, the filter is what goes, not the pixels - and a reduction taken in the meantime both
+    // costs the image and delays the thing that would actually have fixed it. Nothing is frozen
+    // though: with money to spare the controller still buys quality, exactly as before.
+
+    // And while a flip is being priced, nothing moves either. The measurement is a difference between
+    // two readings of the same frame, so a sample-count change halfway through it voids the only
+    // number that says what the filter costs - and without that number the controller is back to
+    // guessing, which is the state this whole rewrite was meant to end.
+    if (app->filterCalArmed && app->settleFrames < kFilterCalibFrames + kStaleFramesAfterChange)
+        return;
+
+    // ---- weigh it once per window, not once per frame --------------------------------------------
+    // The streaks below only mean something if each of them is an independent look at a settled
+    // frame. Left running on every frame they filled inside a single settling period, so the
+    // controller acted on one observation four times over - which is how it came to alternate
+    // between seven different trace scales in half a minute.
+    if (app->decideFrames < kAdjustEveryFrames) return;
+    app->decideFrames = 0;
+
+    // Watchdog on the delivery pace. The command buffer can report that it fits while the display
+    // still misses vsync, so the real interval gets a vote on how much of the budget may be spent -
+    // but not on lateness, which is measured above against the requested frame rate.
+    const bool nearBudget = app->gpuMsAvg > kDeadband * budget;
+    const bool missingVsync = app->cpuMsAvg > frameMs * 1.10 && nearBudget;
+    if (missingVsync) app->cleanPaceStreak = 0; else ++app->cleanPaceStreak;
+    const double spend = missingVsync ? budget * 0.85 : budget;
+    // Spending up is not the same as spending down: a climb that lands exactly on the budget lands on
+    // top of the measurement noise as well, and the next reading then says it is over. Leave a margin
+    // when going up so the settle lands inside the deadband rather than on its edge.
+    const double climbSpend = budget * kClimbMargin;
+
+    // Hysteresis on delivery: spend up only when the pace has been clean for three quarters of a
+    // second, otherwise the measured cost and the delivered pace argue and the image flickers.
+    const bool settledPace = !missingVsync && app->cleanPaceStreak >= 45;
     // Decide on streaks, not on single readings: a frame can be slow for reasons unrelated to the
     // scene (a background process, the compositor), and reacting to one such reading is exactly how
-    // a controller ends up oscillating. Inside the band, hold and stop counting.
-    if (app->gpuMsAvg > budgetUse * 1.04) { ++app->overStreak; app->underStreak = 0; }
-    else if (app->gpuMsAvg < kDeadband * budgetUse) { ++app->underStreak; app->overStreak = 0; }
-    else {
-        app->overStreak = app->underStreak = 0;
-        app->settleFrames = kAdjustEveryFrames;
-        return;
-    }
-    const bool mayReduce = app->overStreak >= 2;
-    const bool mayClimb = app->underStreak >= 3;
+    // a controller ends up oscillating. Inside the band both streaks are cleared but control is not
+    // handed back: a frame sitting in the middle of the band is precisely the one that can afford the
+    // filter back, and returning early here used to make that branch unreachable - the reading never
+    // stayed low long enough to build the streak the restore was waiting for.
+    const bool overBudget = app->gpuMsAvg > spend * 1.04;
+    if (overBudget) { ++app->overStreak; app->underStreak = 0; }
+    else if (app->gpuMsAvg < kDeadband * spend) { ++app->underStreak; app->overStreak = 0; }
+    else { app->overStreak = app->underStreak = 0; }
+    const bool mayReduce = app->overStreak >= 2 && !filterIsOursToGive;
+    const bool mayClimb = app->underStreak >= 3 && !overBudget;
 
-    // Resolution first: keep the window's native size unless even one sample per pixel is too slow.
-    const double sNative = std::max(0.1, double(app->renderScale));
+    // Resolution floor and ceiling. The floor is the configured fraction of the window's own size;
+    // the ceiling is bounded both by the configured multiple and by an absolute pixel count, because
+    // the accumulation target is RGBA16F and two slots at 8K cost hundreds of megabytes.
     const double sMin = double(app->cfg.minRenderScale) * sNative;
-    // Supersampling is bounded both by the configured multiple and by an absolute pixel count:
-    // the accumulation target is RGBA16F, so two slots at 8K would cost hundreds of megabytes.
     const double pixelsNative = double(app->swapExtent.width) * double(app->swapExtent.height);
     double sMax = sNative * std::max(1.0, double(app->cfg.maxRenderScale));
     if (pixelsNative > 0.0) {
@@ -499,20 +746,39 @@ void reportGpuFrameTime(App* app, double ms) {
     }
     if (sMax < sMin) sMax = sMin;
 
-    // "Sample units" the budget buys at scale 1.0: one unit is one kilopixel traced with one sample.
-    const double S = budgetUse / (app->msPerSampleKiloPx * kiloPx1);
-
-    // Spend them as: samples at the window's own resolution, then supersampling, then samples again.
-    int k = int(S / (sNative * sNative));
-    if (k < 1) k = 1;
-    if (k > app->cfg.baseSamplesPerFrame) k = app->cfg.baseSamplesPerFrame;
-    double s = std::sqrt(S / double(k));
-    if (s < sMin) s = sMin;
-    if (s > sMax) s = sMax;
-    int wantSpp = int(S / (s * s));  // floor: never over-promise
-    if (wantSpp < 1) wantSpp = 1;
-    if (wantSpp > app->cfg.maxSamplesPerFrame) wantSpp = app->cfg.maxSamplesPerFrame;
-    float wantScale = float(s);
+    // What the budget buys, spent in the order quality is worth it: the window's own resolution
+    // first, then samples up to the ceiling, then supersampling with whatever is spare. The filter's
+    // charge is paid before any of it, because it is levied per traced pixel whatever the sample
+    // count is. Solving in closed form rather than stepping means the controller goes where it thinks
+    // it should in one move, instead of walking there through six rebuilds of thirty images each.
+    const double spareAtNative = spend - model.filterOnly(sNative);
+    const double oneSampleAtNative = model.msAt(sNative, 1);
+    const int cap = app->cfg.denoise ? std::max(1, app->cfg.baseSamplesPerFrame)
+                                     : app->cfg.maxSamplesPerFrame;
+    int wantSpp = 1;
+    float wantScale = float(sNative);
+    if (spareAtNative < oneSampleAtNative) {
+        // Not even one sample at full size fits. The filter is already off by the time this can be
+        // true, so shrinking the image is the only lever left, and it goes to wherever one sample
+        // pays for itself rather than straight to the floor.
+        const double perSq = model.msAt(1.0, 1);
+        const double s = perSq > 0.0 ? std::sqrt(spend / perSq) : sMin;
+        wantScale = float(std::min(std::max(s, sMin), sMax));
+    } else {
+        // While the filter is running the extra samples are worth less than the extra pixels, because
+        // the filter is what removes the noise; without it, samples are the whole quality story.
+        const double limit = mayReduce ? spend : climbSpend;
+        const double spareClimb = limit - model.filterOnly(sNative);
+        int k = int(spareClimb / oneSampleAtNative);  // floor: never overpromise
+        if (k > cap) k = cap;
+        if (k < 1) k = 1;
+        wantSpp = k;
+        // Whatever the samples did not spend goes into supersampling, and never into a smaller image:
+        // dropping below the window's own size is the decision made above, not a side effect of
+        // having money left over.
+        const double s = std::sqrt(limit / model.msAt(1.0, k));
+        wantScale = float(std::min(std::max(s, sNative), sMax));
+    }
 
     const int prevSpp = app->liveSpp;
     const float prevScale = app->liveScale;
@@ -521,14 +787,9 @@ void reportGpuFrameTime(App* app, double ms) {
     // one being considered is worth it. Over budget, dropping is mandatory however small the step;
     // under budget, climb only on a difference of two samples or more. That asymmetry is what stops
     // the controller from flapping by one sample on either side of the line.
-    // Hysteresis on delivery: cut above 6% late, climb only below 3%. A desktop run of about 2% late
-    // is ordinary system noise and must not be mistaken for the workload being too heavy, otherwise
-    // the controller refuses to spend anything at all.
-    const bool settledPace = !missingVsync && app->cleanPaceStreak >= 45;
     // A scale change is the expensive one - it reallocates the trace target and replays a frame - so
-    // it has to be worth it: a fifth of the current scale, not a nudge. Sample count, which costs
-    // nothing, still moves in steps of two. A resize is unaffected because it discards the model and
-    // the difference it produces is far larger than this.
+    // it has to be worth it: a fifth of the current scale, not a nudge. A resize is unaffected because
+    // it discards the model and the difference it produces is far larger than this.
     const bool scaleDiffers = fabs(double(wantScale) - double(app->liveScale)) >
                               0.2 * double(app->liveScale);
     const bool scaleMove = scaleDiffers && ((wantScale < app->liveScale && mayReduce) ||
@@ -537,26 +798,66 @@ void reportGpuFrameTime(App* app, double ms) {
                              ? (wantSpp < app->liveSpp)
                              : (mayClimb && settledPace && wantSpp - app->liveSpp >= 2);
 
-    if (scaleMove) {
-        app->liveSpp = wantSpp;
-        setLiveScale(app, wantScale);
-    }
+    // ---- 2. then samples, and resolution only once they are where the model wants them -----------
+    // Samples cost a frame to change and resolution costs thirty images, so samples move first and
+    // the trace target only shrinks once there is nothing left to save that way.
     if (sppMove && wantSpp != app->liveSpp) {
+        logMsg("quality decision: samples %d -> %d (gpu %.1f ms, budget %.1f ms)\n",
+               app->liveSpp, wantSpp, app->gpuMsAvg, spend);
         app->liveSpp = wantSpp;
         // The displayed image divides by the sample count, so changing it must restart accumulation.
         app->samplesAccumulated = 0;
+        // Nothing was reallocated to change the sample count, so the longer allowance for a rebuild
+        // must not carry over from whatever change happened before this one.
+        app->lastChangeCostMs = 0.0;
         invalidateQuality(app);
         ++app->qualityChanges;
         app->qualityChanged = true;
-    } else if (!scaleMove) {
-        app->settleFrames = kAdjustEveryFrames;  // settled: keep evaluating, change nothing
+    } else if (scaleMove) {
+        logMsg("quality decision: scale %.2f -> %.2f (gpu %.1f ms, budget %.1f ms)\n",
+               double(app->liveScale), double(wantScale), app->gpuMsAvg, spend);
+        app->liveSpp = wantSpp;
+        setLiveScale(app, wantScale);
+    }
+
+    // ---- 3. and the filter is the last thing taken back ------------------------------------------
+    // Only once samples and resolution have climbed as far as the budget lets them and there is room
+    // left over for the filter on top of that: the same cost model read in the other direction. It is
+    // checked after the climbs above so that a frame with spare money spends it on pixels first, and
+    // it asks for room for the whole of the filter's price, not merely some of it - putting the
+    // filter back and taking it again a moment later costs two rebuilds and the noise in between.
+    // What is asked is not a wish for more samples or a bigger target: both of those are looked at
+    // before this, and the frame has to pay for the filter on top of wherever it has climbed to.
+    // The old version also demanded that the model want no more scale than it already had, and that
+    // deadlocked on a real machine: the model wanted a fifth more scale, the hysteresis said a fifth
+    // was not worth a rebuild, and so neither the climb nor the restore ever happened.
+    const bool nothingMoved = prevSpp == app->liveSpp && prevScale == app->liveScale;
+    // Frames have to be arriving on time, not merely cheap. The filter was given up because the
+    // machine was missing its target, and taking it back while it is still missing that target -
+    // however much the timestamps say the frame could afford it - is the flip that would be reversed
+    // on the next late reading, which is the behaviour this ordering exists to remove.
+    if (!app->cfg.denoise && app->denoiseAutoOff && !app->denoiseUserToggled &&
+        app->denoiseFlips < kMaxDenoiseFlips && !lateNow && !overBudget && settledPace &&
+        nothingMoved) {
+        const double withFilter = model.msAt(app->liveScale, app->liveSpp) +
+                                  app->filterMsPerMegaPx * tracedKilo / 1000.0;
+        const double headroom = spend - withFilter;
+        // Room for the whole of it and then some. Putting the filter back and taking it again a
+        // moment later costs two rebuilds and shows noise at both ends of it.
+        if (headroom > 0.25 * spend) {
+            logMsg("quality decision: denoise on (headroom %.1f ms, scale %.2f, spp %d)\n",
+                   headroom, double(app->liveScale), app->liveSpp);
+            app->denoiseAutoOff = false;
+            ++app->denoiseFlips;
+            setDenoiseEnabled(app, true, "budget has room for the filter again");
+        }
     }
 
     if (app->verbose && (prevSpp != app->liveSpp || prevScale != app->liveScale))
         logMsg("  quality: %.1f ms measured -> %d spp at scale %.2f (budget %.1f ms of %.1f, "
-               "change cost %.1f ms)\n",
-               app->gpuMsAvg, app->liveSpp, app->liveScale, budget, frameMs,
-               app->lastChangeCostMs);
+               "change cost %.1f ms, filter %.2f ms/MP, model refused %d)\n",
+               app->gpuMsAvg, app->liveSpp, app->liveScale, spend, frameMs,
+               app->lastChangeCostMs, app->filterMsPerMegaPx, app->modelRejects);
 }
 
 static void readAndReportGpuTime(App* app, int slotIdx) {
@@ -651,7 +952,11 @@ static float halfToFloat(uint16_t h) {
 }
 
 void readHdrToCpu(App* app, int slotIdx, std::vector<float>* out) {
-    const GpuImage& im = app->hdr[slotIdx];
+    // While the filter is on screen, that is the image worth saving. The accumulation target holds
+    // only one frame when filtering, on purpose, so reading it back would show a single sample.
+    const GpuImage& im = app->cfg.denoise
+                             ? app->denPP[slotIdx][1][0]
+                             : app->hdr[slotIdx];
     uint32_t pxBytes = (im.format == VK_FORMAT_R32G32B32A32_SFLOAT) ? 16 : 8;
     VkDeviceSize bytes = VkDeviceSize(im.width) * im.height * pxBytes;
 
@@ -748,12 +1053,21 @@ int runWindowed(App* app) {
     app->userScaleCap = app->renderScale;
     app->liveSpp = std::max(1, app->cfg.samplesPerFrame);
     applyQualityMode(app->cfg);
+    // While filtering, extra samples are worth less than extra resolution: the filter is what
+    // removes the noise, so the budget should buy pixels and let one sample per frame stand.
+    if (app->cfg.denoise && app->cfg.autoQuality) app->cfg.baseSamplesPerFrame = 1;
     GLFWmonitor* mon = glfwGetPrimaryMonitor();
     const GLFWvidmode* vm = mon ? glfwGetVideoMode(mon) : nullptr;
     if (vm && vm->refreshRate > 0) app->cfg.detectedRefresh = float(vm->refreshRate);
     logMsg("display: %d Hz panel, targeting %.0f fps, vsync %s, quality mode %s\n",
            vm ? vm->refreshRate : 0, effectiveFps(app->cfg), app->cfg.vsync ? "on" : "off",
            app->cfg.qualityMode.c_str());
+    // Where the run starts from, stated rather than inferred: the controller's first move is
+    // measured against this, and a test of the decisions needs to know what was on before any of
+    // them were made.
+    logMsg("quality start: denoise %s, scale %.2f, spp %d, filter %.2f ms per megapixel\n",
+           app->cfg.denoise ? "on" : "off", double(app->liveScale), app->liveSpp,
+           app->filterMsPerMegaPx);
     invalidateQuality(app);
     // Where the frame time actually goes; makes "is it us or the compositor?" an answered question.
     double accPoll = 0, accPrep = 0;
@@ -771,7 +1085,7 @@ int runWindowed(App* app) {
     app->samplesAccumulated = 0;
     applyHdrSize(app, app->swapExtent.width, app->swapExtent.height);
     double lastLoopT = 0.0;
-    bool altEnterWasDown = false, cursorNormal = true;
+    bool altEnterWasDown = false, cursorNormal = true, denoiseWasDown = false;
 
     while (!glfwWindowShouldClose(app->window)) {
         glfwPollEvents();
@@ -821,6 +1135,7 @@ int runWindowed(App* app) {
         app->simTime += dt;
         // Smooth motion needs more than a good average: a stray 33 ms interval between two 16 ms
         // ones is exactly what the eye reads as a stutter, so the spread is tracked, not the mean.
+        app->lastFrameLate = dt > 1.25 / double(std::max(10, app->cfg.targetFps > 0 ? int(app->cfg.targetFps) : 60));
         if (dt < dtMin) dtMin = dt;
         if (dt > dtMax) dtMax = dt;
         if (dt > 0.020f) ++dtLate;
@@ -833,6 +1148,11 @@ int runWindowed(App* app) {
         if (altDown && enterDown && !altEnterWasDown) toggleFullscreen(app);
         altEnterWasDown = altDown && enterDown;
 
+        // ---- N toggles the denoiser, so its effect can be judged side by side -----------------
+        const bool denoiseDown = glfwGetKey(app->window, GLFW_KEY_N) == GLFW_PRESS;
+        if (denoiseDown && !denoiseWasDown) toggleDenoise(app);
+        denoiseWasDown = denoiseDown;
+
         // ---- WASD takes the camera; ten idle seconds hands it back -----------------------------
         const int fwdKey = (glfwGetKey(app->window, GLFW_KEY_W) == GLFW_PRESS) -
                            (glfwGetKey(app->window, GLFW_KEY_S) == GLFW_PRESS);
@@ -840,6 +1160,31 @@ int runWindowed(App* app) {
                             (glfwGetKey(app->window, GLFW_KEY_A) == GLFW_PRESS);
         if ((fwdKey || sideKey) && !app->freeCam) enterFreeCam(app);
         if (fwdKey || sideKey) app->lastWasd = glfwGetTime();
+        // Drives the same code path the N key does: scripted keystrokes never reach this window, so
+        // the toggle is exercised by frame number instead.
+        if (app->testToggleFrame >= 0 && int(app->frameIndex) == app->testToggleFrame)
+            toggleDenoise(app);
+
+        if (app->testGiveUpFrame >= 0 && int(app->frameIndex) == app->testGiveUpFrame) {
+            // Force the condition the controller now acts on: frames that are missing the target
+            // while the filter is still on. Pinning quality to the floor is no longer part of it -
+            // the filter goes before the floor is ever reached - and a machine fast enough to hold
+            // 60 fps would otherwise never report a late frame, which is exactly the case this flag
+            // exists to exercise.
+            app->denoiseLateStreak = kDenoiseGiveUpFrames;
+            app->testLateForced = true;
+            logMsg("test: forced a frame rate that is missing its target\n");
+        }
+        if (app->testLateForced && !app->cfg.denoise) {
+            // The forcing asked for one thing: that a run which cannot hold its frame rate give the
+            // filter up. Once that has happened, keeping the lie going would stop the controller
+            // from ever doing the rest of its job - it would spend the remaining run refusing to take
+            // the filter back on a machine that is comfortably making its frames, which is the
+            // opposite of what is left to test.
+            app->testLateForced = false;
+            logMsg("test: forcing stopped, the give-up it was asking for has happened\n");
+        }
+
         if (app->testCamera) {
             // Drives the same state machine from the clock, so the handover can be verified from the
             // log rather than by a human holding keys: free at 2 s, released at 6 s, back at ~16 s.
@@ -895,8 +1240,11 @@ int runWindowed(App* app) {
                    app->freeCam ? "free  " : "handing", app->camBlend, app->camPos[0],
                    app->camPos[1], app->camPos[2], app->yaw, app->pitch);
 
-        const double dtMs = dt * 1000.0;
-        if (dtMs >= 1.0 && dtMs < 72.0) ++app->dtBins[uint32_t(dtMs)];
+        // Lateness is counted here rather than in the controller, because the controller throws away
+        // readings while a change settles and a frame that arrived late arrived late whatever its
+        // timestamps say. The window is reset at each quality change, so the fraction always
+        // describes the settings currently in effect and nothing else.
+        if (app->lastFrameLate) ++app->lateFramesWindow;
         ++app->framesWindow;
         dtSum += dt;
 
@@ -1017,18 +1365,20 @@ int runWindowed(App* app) {
             char title[192];
             if (app->cfg.autoQuality)
                 snprintf(title, sizeof(title),
-                         "Vulkan Ray Tracer - %.0f fps - %ux%u trace %ux%u - %d spp - %s - ESC quits",
+                         "Vulkan Ray Tracer - %.0f fps - %ux%u trace %ux%u - %d spp - %s%s - (ESC) Quit",
                          fps, app->swapExtent.width, app->swapExtent.height, app->hdrWidth,
                          app->hdrHeight, app->liveSpp,
-                         app->usingComputeFallback ? "ray-query" : "RT pipeline");
+                         app->usingComputeFallback ? "ray-query" : "RT pipeline",
+                         app->cfg.denoise ? " - (N) Denoise ON" : " - (N) Denoise OFF");
             else
                 snprintf(title, sizeof(title),
-                         "Vulkan Ray Tracer - %.0f fps - %ux%u trace %ux%u - %d spp - %s%s - ESC quits",
+                         "Vulkan Ray Tracer - %.0f fps - %ux%u trace %ux%u - %d spp - %s%s%s - (ESC) Quit",
                          fps, app->swapExtent.width, app->swapExtent.height,
                          app->hdr[app->slot].width, app->hdr[app->slot].height,
                          app->cfg.autoQuality ? app->liveSpp : app->cfg.samplesPerFrame,
                          app->usingComputeFallback ? "ray-query" : "RT pipeline",
-                         app->camBlend > 0.5f ? " - free look" : "");
+                         app->camBlend > 0.5f ? " - free look" : "",
+                         app->cfg.denoise ? " - (N) Denoise ON" : " - (N) Denoise OFF");
             glfwSetWindowTitle(app->window, title);
             fpsClock = now;
             fpsFrames = 0;
@@ -1057,6 +1407,12 @@ int runCapture(App* app) {
         float t = 0.55f + float(img) * 2.35f;  // spread the orbit so the shots differ
         // Start every still from a guaranteed-zero accumulator. Zeroing it in-shader left stale
         // samples of previous stills behind, which appeared as several exposures in one image.
+        // Stills must be reproducible. The clock position was taken from wall time and only
+        // rounded in the filename, so two runs of the same build rendered slightly different
+        // cameras while claiming the same name, and no before/after pixel comparison could be
+        // trusted. Fixed schedule instead: same image, same time, every run.
+        t = 0.55f + float(img) * 2.35f;
+        app->simTime = t;
         recreateHdrTargets(app, app->captureWidth, app->captureHeight);
         writeTraceDescriptors(app, 0);
         computeInstances(app, t, &instances);
@@ -1067,6 +1423,12 @@ int runCapture(App* app) {
             bool reset = (f == 0);
             ++samples;
             app->frameIndex = uint64_t(f) + 1;
+            // Verbose only, and only while capturing stills: the accumulation behaviour of the still
+            // path was measured to converge at half the expected rate, and this line shows whether a
+            // frame was handed to the tracer as a fresh start or as an addition to the target.
+            if (app->verbose)
+                logMsg("  accum frame %d reset=%d frameIndex=%llu samples=%d\n", f, reset ? 1 : 0,
+                       (unsigned long long)app->frameIndex, samples);
             buildFrameCommand(app, 0, 0, false, instances, t, reset, samples, true);
             VkSubmitInfo si{};
             si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1075,6 +1437,25 @@ int runCapture(App* app) {
             VK_CHECK(vkQueueSubmit(app->queue, 1, &si, app->fence[0]));
             VK_CHECK(vkWaitForFences(app->device, 1, &app->fence[0], VK_TRUE, ~0ull));
             VK_CHECK(vkResetFences(app->device, 1, &app->fence[0]));
+
+            // Raw-sample dump for the convergence investigation: the PNG path quantises to 8 bits
+            // and divides by the frame count, which is exactly the information needed to tell two
+            // similar noise patterns apart. This is the buffer before any of that.
+            // -2 means every frame: comparing frames against each other only means something if they
+                        if (app->captureDumpFrame == -2 || f == app->captureDumpFrame) {
+                std::vector<float> raw;
+                readHdrToCpu(app, 0, &raw);
+                char dn[280];
+                snprintf(dn, sizeof(dn), "%s\\accum_%03d.bin", app->captureDir.c_str(), f);
+                FILE* fp = nullptr;
+                if (fopen_s(&fp, dn, "wb") == 0 && fp) {
+                    const uint32_t dims[2] = { app->captureWidth, app->captureHeight };
+                    fwrite(dims, sizeof(dims), 1, fp);
+                    fwrite(raw.data(), sizeof(float) * raw.size(), 1, fp);
+                    fclose(fp);
+                    logMsg("  dumped raw target after frame %d (%zu floats)\n", f, raw.size());
+                }
+            }
         }
 
         std::vector<float> hdr;
@@ -1083,7 +1464,7 @@ int runCapture(App* app) {
         snprintf(name, sizeof(name), "%s\\frame_%03d_t%.2f.png", app->captureDir.c_str(), img, t);
         // The target holds means per frame, so only the frame count is divided out here.
         writePng(name, app->captureWidth, app->captureHeight, hdr, app->cfg.exposure,
-                 1.0f / float(std::max(1, samples)));
+                 app->cfg.denoise ? 1.0f : 1.0f / float(std::max(1, samples)));
         logMsg("  wrote %s (%d spp)\n", name, samples);
     }
     vkDeviceWaitIdle(app->device);

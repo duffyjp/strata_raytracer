@@ -44,12 +44,21 @@ struct GpuCamera {
     V4 forwardBounces;  // xyz = forward, w = max bounces
     V4 frameSize;       // x = width, y = height, z = 1 if accumulation resets this frame, w = time
     V4 exposureDebug;   // x = exposure, y = frame index, z = radiance clamp, w = sky mode
+    V4 display;         // x = samples accumulated for display, y = flipY, z = spp, w = ssaa
+    V4 sky;             // xyz = horizon colour
+    // 8..11 repeat the same four rows for the previous frame, so a temporal filter can reproject
+    // without knowing how the camera is driven. forward.w is 1 when the previous frame is usable.
+    V4 prevOriginFov, prevRightAspect, prevUp, prevForward;
+    V4 filter;      // x = feature writes on, y = channel view, z = history cap
+    V4 featureA;    // reserved for CPU-side feature readback
+    V4 featureB;
+    V4 featureC;
 };
 
 // Storage block written to the GPU: camera/params, then the material table, then the lights.
 // Byte layout must match shaders/sceneblock.glsl.
 struct SceneGpuData {
-    V4 camera[8];
+    V4 camera[16];
     V4 material[kMaxMaterials * 4];
     V4 light[kMaxLights * 2];
 };
@@ -130,6 +139,22 @@ struct SceneConfig {
     // limits so there is one knob to turn when the frame budget cannot be met: high, balanced,
     // performance or off (no adapting).
     bool vsync = false;
+    // Denoiser. Off by default: the filtered path is experimental and the unfiltered image must stay
+    // exactly what it was. filterDebug shows a single feature channel on screen while wiring it up.
+    bool denoise = true;   // press N to toggle; the controller drops it if the frame budget is unreachable
+    int filterDebug = 0;   // 0 off, 1 albedo, 2 normal, 3 depth
+    float denoiseHistoryCap = 20.f;
+    // Wavelet edge-stopping scales. sigmaZ is in reciprocal-depth units, where a couple of
+    // hundredths already separates surfaces at very different distances - and if it is set too
+    // tight, every tap but the centre is suppressed and the filter silently becomes the identity.
+    float denoiseSigmaZ = 0.02f;
+    // Measured, not inherited from the paper: one sample per pixel, 1280x720, error against a
+    // 512-frame reference. sigmaL 4 put the filter at RMSE 12.91; 24 puts it at 10.29. The
+    // paper tunes this on scenes where depth and normals separate surfaces sharply; here the
+    // checkerboard floor has a flat normal and a hard albedo edge, so the luminance term has to
+    // do the work the geometric terms cannot. Sweep results in docs/svgf-status.md.
+    float denoiseSigmaL = 24.0f;
+    float denoiseSigmaN = 128.f;
     std::string qualityMode = "high";
     float detectedRefresh = 0.f;   // read from the monitor at startup; 0 means fall back to targetFps
     int baseSamplesPerFrame = 4;

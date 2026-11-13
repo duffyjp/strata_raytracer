@@ -5,6 +5,8 @@
 file(GLOB NEW_GLOB LIST_DIRECTORIES true "C:/Users/Jacob/Documents/Raytracer/shaders/*.comp")
 set(OLD_GLOB
   "C:/Users/Jacob/Documents/Raytracer/shaders/fallback.comp"
+  "C:/Users/Jacob/Documents/Raytracer/shaders/svgf_atrous.comp"
+  "C:/Users/Jacob/Documents/Raytracer/shaders/svgf_temporal.comp"
   )
 if(NOT "${NEW_GLOB}" STREQUAL "${OLD_GLOB}")
   message("-- GLOB mismatch!")

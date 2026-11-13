@@ -29,8 +29,19 @@ static void printHelp() {
         "  --quality MODE       burden ceiling: high | balanced | performance | off  [high]\n"
         "                         balanced caps supersampling at 1.25x, performance at 1.0x\n"
         "  --no-vsync           present without waiting for the display (mailbox/immediate)\n"
+        "  --denoise            turn the SVGF denoiser on (it is on by default while rendering to the\n"
+        "                       window; press N at any time to toggle, the title bar shows which)\n"
+        "  --no-denoise         turn it off at start-up instead\n"
+        "  --gbuf CH            show what the denoiser sees or produced: albedo | normal | depth |\n"
+        "                       denoised | diff (what the filter changed) | variance (its noise estimate)\n"
+        "  --filter-z F         denoiser depth edge stopping                  [0.02]\n"
+        "  --filter-n F         denoiser normal edge stopping                 [128]\n"
+        "  --filter-l F         denoiser brightness edge stopping             [24]\n"
         "  --refresh N          treat the panel as running at N Hz (detected automatically)\n"
         "  --target-fps N       frame rate the adaptive controller aims for       [60]\n"
+        "  --test-toggle N      toggle the denoiser after N rendered frames (same path as the N key)\n"
+        "  --dump-accum N       during --capture, also write the raw float target after accumulation\n"
+        "                       frame N, as <dir>\accum_NNN.bin, for noise analysis\n"
         "  --max-spp N          most samples per pixel per frame it may spend     [8]\n"
         "  --min-scale F        smallest trace resolution it may fall back to     [0.40]\n"
         "  --compute            force the ray-query compute fallback\n"
@@ -53,6 +64,9 @@ static int realMain(int argc, char** argv) {
     int cliMaxSpp = 0;
     bool cliVsync = true, cliVsyncGiven = false;
     bool cliFullscreen = false;
+    int cliDenoise = 0;
+    int cliWinW = 0, cliWinH = 0;  // 0 = not mentioned, 1 = --denoise, -1 = --no-denoise
+    int cliFilterDebug = 0;
     float cliRefresh = 0.f;
     std::string cliQuality;
 
@@ -78,6 +92,7 @@ static int realMain(int argc, char** argv) {
         else if (a == "--capture") app.captureCount = atoi(next("--capture"));
         else if (a == "--autoexit") app.autoExitSeconds = atof(next("--autoexit"));
         else if (a == "--accum") app.captureAccum = atoi(next("--accum"));
+        else if (a == "--dump-accum") app.captureDumpFrame = atoi(next("--dump-accum"));  // -2 = every frame
         else if (a == "--size") {
             if (!parseSize(next("--size"), &app.captureWidth, &app.captureHeight))
                 fail("--size wants WxH");
@@ -96,6 +111,25 @@ static int realMain(int argc, char** argv) {
         else if (a == "--refresh") { cliRefresh = float(atof(next("--refresh"))); }
         else if (a == "--fullscreen") { cliFullscreen = true; }
         else if (a == "--test-camera") { app.testCamera = true; }
+        else if (a == "--test-toggle") { app.testToggleFrame = atoi(next("--test-toggle")); }
+        else if (a == "--test-give-up") { app.testGiveUpFrame = atoi(next("--test-give-up")); }
+        else if (a == "--test-budget") { app.testBudgetMs = atof(next("--test-budget")); }
+        else if (a == "--window") { sscanf(next("--window"), "%dx%d", &cliWinW, &cliWinH); }
+        else if (a == "--denoise") { cliDenoise = 1; }
+        else if (a == "--no-denoise") { cliDenoise = -1; }
+        else if (a == "--filter-z") { app.cfg.denoiseSigmaZ = float(atof(next("--filter-z"))); }
+        else if (a == "--filter-l") { app.cfg.denoiseSigmaL = float(atof(next("--filter-l"))); }
+        else if (a == "--filter-n") { app.cfg.denoiseSigmaN = float(atof(next("--filter-n"))); }
+        else if (a == "--gbuf") {
+            std::string ch = next("--gbuf");
+            cliFilterDebug = 0;
+            if (ch == "albedo") cliFilterDebug = 1;
+            else if (ch == "normal") cliFilterDebug = 2;
+            else if (ch == "depth") cliFilterDebug = 3;
+            else if (ch == "denoised") cliFilterDebug = 4;
+            else if (ch == "diff") cliFilterDebug = 5;
+            else if (ch == "variance") cliFilterDebug = 6;
+        }
         else if (a == "--min-scale") { cliMinScale = float(atof(next("--min-scale"))); } else if (a == "--compute") forceCompute = true;
         else if (a == "--rt") requireRt = true;
         else if (a == "--verbose" || a == "-v") app.verbose = true;
@@ -114,11 +148,26 @@ static int realMain(int argc, char** argv) {
     if (!cliVsync) app.cfg.vsync = false;
     if (cliVsyncGiven) app.cfg.vsync = cliVsync;
     if (!cliQuality.empty()) app.cfg.qualityMode = cliQuality;
+    if (cliDenoise > 0) app.cfg.denoise = true;
+    if (cliDenoise < 0) app.cfg.denoise = false;
+    // A still is the opposite job to a moving image. The filter treats every frame it is handed as
+    // an independent estimate and keeps its own history, which is why it turns accumulation off -
+    // precisely wrong for a still that is averaging dozens of frames into one clean image. Stills
+    // therefore stay unfiltered unless --denoise is named explicitly.
+    if (app.captureCount > 0 && cliDenoise == 0 && cliFilterDebug == 0) {
+        app.cfg.denoise = false;
+        logMsg("stills: denoiser left off (a still averages frames; it does not filter them)\n");
+    }
+    if (cliFilterDebug > 0) { app.cfg.filterDebug = cliFilterDebug; app.cfg.denoise = true; }
     if (cliRefresh > 0.f) app.cfg.detectedRefresh = cliRefresh;  // overrides the measured panel rate
     if (cliMinScale > 0.f) app.cfg.minRenderScale = cliMinScale;
 
     // 2. Window (skipped entirely in capture mode).
     int winW = 1280, winH = 720;
+    // Debug/repro only: the large-window case cannot otherwise be reproduced from a script, and the
+    // per-phase timing that goes with --verbose is the only way to see whether such a frame is slow
+    // on the GPU side or on the CPU side.
+    if (cliWinW > 0 && cliWinH > 0) { winW = cliWinW; winH = cliWinH; }
     if (app.captureCount == 0) {
         if (!glfwInit()) fail("glfwInit failed");
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
@@ -153,6 +202,12 @@ static int realMain(int argc, char** argv) {
     logMsg("step: textures\n");
     createDescriptorLayouts(&app);
     createShaderModulesAndPipelines(&app);
+    if (app.cfg.denoise && app.usingComputeFallback) {
+        // The fallback path never writes the feature images, so filtering there would run on
+        // inputs that were never filled in. Disabled rather than silently wrong.
+        app.cfg.denoise = false;
+        logMsg("denoise: unavailable on the ray-query fallback, disabled\n");
+    }
     logMsg("step: %s pipeline ready\n", app.usingComputeFallback ? "compute fallback" : "ray-tracing");
 
     int rc = 0;
