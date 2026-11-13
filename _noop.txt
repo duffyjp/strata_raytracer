@@ -1,9 +1,0 @@
-// TEMPORARY: list core features reported false, to pick a self-test target.
-#include "volk.h"
-#include <GLFW/glfw3.h>
-#include <cstdio>
-#include <vector>
-#include <cstring>
-int main() {
-    return 0;
-}
