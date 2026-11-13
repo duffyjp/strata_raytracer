@@ -1,0 +1,123 @@
+name: release
+
+# Building happens on a tag push (v1.0.0, v1.0.1-rc1, ...). The workflow can also be run by hand
+# from the Actions tab, which builds the same artefact without publishing a release - useful for
+# checking that a branch would release cleanly.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Also publish a GitHub release for this build'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    # Creating a release needs write access to the repository. Repository settings can narrow this
+    # further, but read-only - the default on many repos - makes the publish step fail.
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      # build.ps1 downloads the official Khronos glslang CLI if it is not already unpacked. It is
+      # pinned to one release inside build.ps1, so the cache key does not need to track a version
+      # here - if that pin changes, the key should change with it.
+      - name: cache glslang
+        uses: actions/cache@v4
+        with:
+          path: tools/glslang
+          key: glslang-16.6.0-windows-x64
+
+      - name: build
+        shell: pwsh
+        run: .\build.ps1
+
+      # The headless still path needs no window and no display, so it is the cheapest honest proof
+      # that the binary actually renders: it builds the acceleration structures, traces and writes a
+      # PNG, exiting non-zero if anything along the way failed.
+      #
+      # GitHub's hosted Windows runners have no Vulkan-capable GPU, so on those the app cannot start
+      # and this is not evidence about the build. A real failure - a missing pak, a shader that will
+      # not load, a fatal after a device was chosen - still fails the release. Run this on a
+      # self-hosted runner with a GPU and it becomes a true gate.
+      - name: smoke test
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path smoke | Out-Null
+          & build\bin\raytracer.exe --capture 1 --accum 8 --size 640x360 --out smoke
+          $code = $LASTEXITCODE
+          $log = if (Test-Path build\bin\raytracer.log) { Get-Content build\bin\raytracer.log -Raw } else { '' }
+          $noGpu = ($log -match 'no Vulkan-capable GPU') -or ($log -match 'Vulkan runtime installed') -or
+                   ($log -match 'volkInitialize failed') -or (@(($log -split "`n") |
+                     Where-Object { $_ -match 'usable=' -and $_ -notmatch 'ray-tracing pipeline|ray-query' } |
+                     Measure-Object).Count -ge 1 -and $log -notmatch 'rendering on:')
+          $png = Get-ChildItem smoke -Filter *.png | Select-Object -First 1
+          if ($png -and $code -eq 0) { "wrote $($png.Name) ($($png.Length) bytes) - renders on this runner"; exit 0 }
+          if ($noGpu) {
+            "::warning::no Vulkan adapter on this runner, skipping the render smoke test"
+            $log | Select-String 'adapter |fatal' | ForEach-Object { "  $($_.Line.Trim())" }
+            exit 0
+          }
+          throw "smoke test failed: exit $code, png=$($png -ne $null)"
+
+      - name: collect the log if something failed
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: diagnostics
+          path: |
+            build/bin/raytracer.log
+            build/**/*.log
+          if-no-files-found: ignore
+
+      - name: package
+        shell: pwsh
+        run: |
+          $tag = if ('${{ github.ref_name }}' -like 'v*') { '${{ github.ref_name }}' } else { 'v0.0.0-' + '${{ github.sha }}'.Substring(0,7) }
+          $staging = 'pkg'
+          $inner = "strata-raytracer-$tag-windows-x64"
+          Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "$staging/$inner" | Out-Null
+          Copy-Item build\bin\raytracer.exe, build\bin\scene.pak "$staging/$inner/"
+          Copy-Item README.md, LICENSE "$staging/$inner/"
+          # Unzipping must leave one tidy folder holding the program and its archive, rather than
+          # two files dropped into whatever directory the user was standing in.
+          Compress-Archive -Path "$staging/$inner" -DestinationPath "$inner.zip" -CompressionLevel Optimal
+          "artefact: $inner.zip ($([math]::Round((Get-Item "$inner.zip").Length/1kb)) KB)"
+          "RELEASE_ZIP=$inner.zip" >> $env:GITHUB_ENV
+          "RELEASE_NAME=Ray tracer $tag (Windows x64)" >> $env:GITHUB_ENV
+
+      - name: verify the archive is self-contained
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path "$env:RELEASE_ZIP"))
+          $names = @($zip.Entries | ForEach-Object { $_.FullName })
+          $zip.Dispose()
+          "contents of $env:RELEASE_ZIP`:"
+          $names | ForEach-Object { "  $_" }
+          foreach ($required in 'raytracer.exe', 'scene.pak') {
+            if (-not ($names | Where-Object { $_ -like "*$required" })) { throw "the archive is missing $required" }
+          }
+
+      - name: publish the release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ env.RELEASE_NAME }}
+          files: ${{ env.RELEASE_ZIP }}
+          generate_release_notes: true

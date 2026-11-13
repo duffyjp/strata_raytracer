@@ -29,3 +29,7 @@ __pycache__/
 tools/glslang/
 tools/*.zip
 tools/glslang-src/
+
+# Release packaging scratch, produced by the workflow's package step.
+pkg/
+smoke/
