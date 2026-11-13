@@ -128,6 +128,18 @@ struct App {
 
     // state
     SceneConfig cfg;
+    // Window and camera control.
+    bool fullscreen = false;
+    int winRect[4] = {80, 60, 1280, 720};   // remembered so Alt+Enter can restore the window
+    bool freeCam = false;                   // WASD has the camera (false also covers "handing back")
+    float camBlend = 0.f;                   // 0 = automated orbit, 1 = free camera, eased between
+    float yaw = 0.f, pitch = 0.f;
+    float camPos[3] = {0.f, 0.f, 0.f};
+    double lastWasd = -1e9;
+    bool cursorTracked = false;
+    bool testCamera = false;                // drives the same state machine from the clock, for tests
+    float orbitO[3] = {0.f, 0.f, 0.f};      // last automated camera, so taking over does not jump
+    float orbitF[3] = {0.f, 0.f, -1.f};
     Pak pak;
     bool pakLoaded = false;
     uint64_t frameIndex = 0;
@@ -232,6 +244,7 @@ void createFramebuffers(App* app);
 void createPresentPipeline(App* app);
 void createFrameSync(App* app);
 int runWindowed(App* app);
+void toggleFullscreen(App* app);   // Alt+Enter at runtime, or --fullscreen at startup
 int runCapture(App* app);
 void createTimingQueries(App* app);
 // Feed one measured GPU frame time (ms) to the controller; it re-picks quality when warranted.

@@ -376,6 +376,42 @@ static void setLiveScale(App* app, float s) {
     app->qualityChanged = true;
 }
 
+// Alt+Enter, as Windows users expect: fullscreen on the primary monitor's own mode, and back to the
+// window exactly where it was.
+void toggleFullscreen(App* app) {
+    GLFWmonitor* mon = glfwGetPrimaryMonitor();
+    const GLFWvidmode* vm = mon ? glfwGetVideoMode(mon) : nullptr;
+    if (!mon || !vm) return;
+    if (app->fullscreen) {
+        glfwSetWindowMonitor(app->window, nullptr, app->winRect[0], app->winRect[1],
+                             app->winRect[2], app->winRect[3], 0);
+        app->fullscreen = false;
+    } else {
+        glfwGetWindowPos(app->window, &app->winRect[0], &app->winRect[1]);
+        glfwGetWindowSize(app->window, &app->winRect[2], &app->winRect[3]);
+        glfwSetWindowMonitor(app->window, mon, 0, 0, vm->width, vm->height, vm->refreshRate);
+        app->fullscreen = true;
+    }
+    app->resizePending = true;  // the swap chain follows the new extent
+    logMsg("window: %s (%dx%d)\n", app->fullscreen ? "fullscreen" : "windowed",
+           vm->width, vm->height);
+}
+
+// Taking the camera over must start exactly where the automated one is, or the first frame of free
+// look reads as a jump.
+static void enterFreeCam(App* app) {
+    const float* f = app->orbitF;
+    app->pitch = asinf(std::max(-0.999f, std::min(0.999f, f[1])));
+    app->yaw = atan2f(f[0], f[2]);
+    app->camPos[0] = app->orbitO[0];
+    app->camPos[1] = app->orbitO[1];
+    app->camPos[2] = app->orbitO[2];
+    app->freeCam = true;
+    app->cursorTracked = false;
+    glfwSetInputMode(app->window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    logMsg("camera: free look (WASD to move, mouse to look; idle 10 s hands control back)\n");
+}
+
 void reportGpuFrameTime(App* app, double ms) {
     if (!app->cfg.autoQuality || !app->timingSupported || ms <= 0.0) return;
     if (app->settleFrames < kStaleFramesAfterChange) { ++app->settleFrames; return; }
@@ -407,7 +443,9 @@ void reportGpuFrameTime(App* app, double ms) {
     if (modeCount >= 10)
         for (uint32_t i = lateAbove; i < 72; ++i) lateCount += app->dtBins[i];
     const double lateFrac = histTotal >= 30 ? double(lateCount) / double(histTotal) : 0.0;
-    const double budget = periodMs * (1.0 - double(app->cfg.qualityHeadroom));
+    const double kCpuReserveMs = 2.5;  // the loop's own stages, which the GPU timestamp does not see
+    const double budget =
+        std::max(1.5, periodMs * (1.0 - double(app->cfg.qualityHeadroom)) - kCpuReserveMs);
     // Watchdog. The command buffer can report that it fits while the display still misses vsync, so
     // the real interval gets a vote too: aim lower until the pace recovers, and refuse to climb
     // again until the pace has been clean for three quarters of a second - otherwise the two
@@ -733,6 +771,7 @@ int runWindowed(App* app) {
     app->samplesAccumulated = 0;
     applyHdrSize(app, app->swapExtent.width, app->swapExtent.height);
     double lastLoopT = 0.0;
+    bool altEnterWasDown = false, cursorNormal = true;
 
     while (!glfwWindowShouldClose(app->window)) {
         glfwPollEvents();
@@ -785,6 +824,77 @@ int runWindowed(App* app) {
         if (dt < dtMin) dtMin = dt;
         if (dt > dtMax) dtMax = dt;
         if (dt > 0.020f) ++dtLate;
+
+        // ---- Alt+Enter: fullscreen, as expected on Windows ------------------------------------
+        const bool altDown = glfwGetKey(app->window, GLFW_KEY_LEFT_ALT) == GLFW_PRESS ||
+                             glfwGetKey(app->window, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS;
+        const bool enterDown = glfwGetKey(app->window, GLFW_KEY_ENTER) == GLFW_PRESS ||
+                               glfwGetKey(app->window, GLFW_KEY_KP_ENTER) == GLFW_PRESS;
+        if (altDown && enterDown && !altEnterWasDown) toggleFullscreen(app);
+        altEnterWasDown = altDown && enterDown;
+
+        // ---- WASD takes the camera; ten idle seconds hands it back -----------------------------
+        const int fwdKey = (glfwGetKey(app->window, GLFW_KEY_W) == GLFW_PRESS) -
+                           (glfwGetKey(app->window, GLFW_KEY_S) == GLFW_PRESS);
+        const int sideKey = (glfwGetKey(app->window, GLFW_KEY_D) == GLFW_PRESS) -
+                            (glfwGetKey(app->window, GLFW_KEY_A) == GLFW_PRESS);
+        if ((fwdKey || sideKey) && !app->freeCam) enterFreeCam(app);
+        if (fwdKey || sideKey) app->lastWasd = glfwGetTime();
+        if (app->testCamera) {
+            // Drives the same state machine from the clock, so the handover can be verified from the
+            // log rather than by a human holding keys: free at 2 s, released at 6 s, back at ~16 s.
+            const double el = glfwGetTime() - startT;
+            if (el > 2.0 && el < 6.0) {
+                if (!app->freeCam) enterFreeCam(app);
+                app->lastWasd = glfwGetTime();
+                app->yaw += 0.5f * float(dt);
+                app->camPos[2] += 2.0f * float(dt);
+            }
+        }
+        if (app->freeCam) {
+            // Look by re-centring the pointer and reading how far it moved: no callback, and no
+            // run-away when the pointer reaches an edge. Centred on the window size, because cursor
+            // coordinates are not framebuffer coordinates on a DPI-scaled display.
+            int ww = 0, wh = 0;
+            glfwGetWindowSize(app->window, &ww, &wh);
+            double mx = 0.0, my = 0.0;
+            glfwGetCursorPos(app->window, &mx, &my);
+            if (app->cursorTracked && ww > 0 && wh > 0) {
+                app->yaw -= float(mx - ww * 0.5) * 0.0022f;
+                app->pitch -= float(my - wh * 0.5) * 0.0022f;
+                app->pitch = std::max(-1.45f, std::min(1.45f, app->pitch));
+            }
+            if (ww > 0 && wh > 0) glfwSetCursorPos(app->window, ww * 0.5, wh * 0.5);
+            app->cursorTracked = true;
+            // Movement stays in the horizontal plane - no vertical control yet.
+            const float speed = glfwGetKey(app->window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ? 12.f : 4.f;
+            const float fx = sinf(app->yaw), fz = cosf(app->yaw);
+            app->camPos[0] += (fx * fwdKey + -fz * sideKey) * speed * float(dt);
+            app->camPos[2] += (fz * fwdKey + fx * sideKey) * speed * float(dt);
+            if (glfwGetTime() - app->lastWasd > 10.0) {
+                app->freeCam = false;
+                logMsg("camera: idle for 10 s, easing back to the orbit\n");
+            }
+        }
+        // Taking control must feel immediate, handing it back must not be noticeable, so the two
+        // directions ease at different rates.
+        const float wantBlend = app->freeCam ? 1.f : 0.f;
+        const float rate = app->freeCam ? 8.f : 0.7f;
+        if (app->camBlend < wantBlend)
+            app->camBlend = std::min(wantBlend, app->camBlend + rate * float(dt));
+        else if (app->camBlend > wantBlend)
+            app->camBlend = std::max(wantBlend, app->camBlend - rate * float(dt));
+        if (app->freeCam) cursorNormal = false;
+        else if (app->camBlend <= 0.f && !cursorNormal) {
+            glfwSetInputMode(app->window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+            cursorNormal = true;
+            app->cursorTracked = false;
+        }
+        if (app->verbose && (app->freeCam || app->camBlend > 0.f) && app->frameIndex % 30 == 0)
+            logMsg("  cam: %s blend %.2f pos %.1f %.1f %.1f yaw %.2f pitch %.2f\n",
+                   app->freeCam ? "free  " : "handing", app->camBlend, app->camPos[0],
+                   app->camPos[1], app->camPos[2], app->yaw, app->pitch);
+
         const double dtMs = dt * 1000.0;
         if (dtMs >= 1.0 && dtMs < 72.0) ++app->dtBins[uint32_t(dtMs)];
         ++app->framesWindow;
@@ -864,6 +974,29 @@ int runWindowed(App* app) {
         accPresent += lap();
         if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) app->resizePending = true;
 
+        // Frame limiter, used when presentation does not pace us. Rendering 112 fps into a 60 Hz
+        // display means several frames are produced per refresh and only the last one is ever shown,
+        // so each displayed frame is on screen for an uneven number of refreshes - which reads as
+        // rough motion even though the fps number looks great. Holding the loop to the panel rate
+        // with a high-resolution timer keeps the interval steady without FIFO's queue of pending
+        // presents, which is where the extra latency comes from.
+        if (!app->cfg.vsync) {
+            static HANDLE paceTimer = CreateWaitableTimerExW(
+                nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            const double spent = glfwGetTime() - now;
+            const double remain = 1.0 / effectiveFps(app->cfg) - spent;
+            if (remain > 0.0008) {
+                if (paceTimer) {
+                    LARGE_INTEGER due;
+                    due.QuadPart = -(LONGLONG)(remain * 1e7);  // relative, 100 ns units
+                    SetWaitableTimer(paceTimer, &due, 0, nullptr, nullptr, FALSE);
+                    WaitForSingleObject(paceTimer, 100);
+                } else {
+                    std::this_thread::sleep_for(std::chrono::microseconds(int64_t(remain * 1e6)));
+                }
+            }
+        }
+
         if (app->verbose && app->frameIndex % 60 == 0) {
             double n = double(app->frameIndex + 1);
             logMsg("  per-frame ms: poll %.1f  prep %.1f  wait %.1f  acquire %.1f  record %.1f"
@@ -890,9 +1023,12 @@ int runWindowed(App* app) {
                          app->usingComputeFallback ? "ray-query" : "RT pipeline");
             else
                 snprintf(title, sizeof(title),
-                         "Vulkan Ray Tracer - %.0f fps - %ux%u (%s) - ESC quits", fps,
-                         app->swapExtent.width, app->swapExtent.height,
-                         app->usingComputeFallback ? "ray-query" : "RT pipeline");
+                         "Vulkan Ray Tracer - %.0f fps - %ux%u trace %ux%u - %d spp - %s%s - ESC quits",
+                         fps, app->swapExtent.width, app->swapExtent.height,
+                         app->hdr[app->slot].width, app->hdr[app->slot].height,
+                         app->cfg.autoQuality ? app->liveSpp : app->cfg.samplesPerFrame,
+                         app->usingComputeFallback ? "ray-query" : "RT pipeline",
+                         app->camBlend > 0.5f ? " - free look" : "");
             glfwSetWindowTitle(app->window, title);
             fpsClock = now;
             fpsFrames = 0;

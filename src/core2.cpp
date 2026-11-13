@@ -241,6 +241,37 @@ void fillSceneData(App* app, SceneGpuData* d, float t, uint32_t w, uint32_t h, b
     float aspect = h ? float(w) / float(h) : 1.f;
     float tanHalf = tanf(C.fovDeg * float(M_PI) / 360.f);
 
+    // Keep the automated camera around: when the player hands control back, the handover starts from
+    // wherever the orbit actually is this frame, which is what makes the blend invisible.
+    app->orbitO[0] = o[0]; app->orbitO[1] = o[1]; app->orbitO[2] = o[2];
+    app->orbitF[0] = f[0]; app->orbitF[1] = f[1]; app->orbitF[2] = f[2];
+
+    // Free-camera blend. Both bases are built with the same handedness, so interpolating the origin
+    // and the vectors and re-orthogonalising is enough - and easing it is what stops the view from
+    // snapping when ten seconds without WASD returns the camera to its orbit.
+    const float blend = app->camBlend;
+    if (blend > 0.0005f) {
+        float ff[3] = {sinf(app->yaw) * cosf(app->pitch), sinf(app->pitch),
+                       cosf(app->yaw) * cosf(app->pitch)};
+        float fl = sqrtf(ff[0] * ff[0] + ff[1] * ff[1] + ff[2] * ff[2]);
+        if (fl > 1e-6f) for (int i = 0; i < 3; ++i) ff[i] /= fl;
+        for (int i = 0; i < 3; ++i) {
+            o[i] += (app->camPos[i] - o[i]) * blend;
+            f[i] += (ff[i] - f[i]) * blend;
+        }
+        float fl2 = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+        if (fl2 > 1e-6f) for (int i = 0; i < 3; ++i) f[i] /= fl2;
+        // Derive the side and up vectors from the blended forward rather than interpolating them:
+        // lerping a basis is what shears the picture halfway through a transition.
+        r[0] = -f[2]; r[1] = 0.f; r[2] = f[0];
+        float rl2 = sqrtf(r[0] * r[0] + r[2] * r[2]);
+        if (rl2 < 1e-5f) { r[0] = 1.f; r[2] = 0.f; rl2 = 1.f; }
+        r[0] /= rl2; r[2] /= rl2;
+        u[0] = r[1] * f[2] - r[2] * f[1];
+        u[1] = r[2] * f[0] - r[0] * f[2];
+        u[2] = r[0] * f[1] - r[1] * f[0];
+    }
+
     d->camera[0] = V4(o[0], o[1], o[2], tanHalf);
     d->camera[1] = V4(r[0], r[1], r[2], aspect);
     d->camera[2] = V4(u[0], u[1], u[2], 1.f);

@@ -22,8 +22,13 @@ build\bin\raytracer.exe
 
 * The window is a standard resizable Windows window - drag any border or maximise it and the render
   target follows.
-* **ESC quits.** There is no other interaction: the camera orbits the scene continuously and the two
-  lights orbit at their own rates.
+* **ESC quits.** **Alt+Enter toggles fullscreen** (on the monitor's own mode, returning the window to
+  exactly where it was).
+* **WASD takes the camera.** Any of those keys switches from the automated orbit to a free camera:
+  the mouse looks, WASD walks in the horizontal plane, Shift moves faster. There is no vertical
+  control. Take your hands off for **ten seconds** and the view eases back to the orbit over about a
+  second and a half - taking control is immediate, handing it back is not meant to be noticeable.
+  Mouse capture is released when control is handed back.
 * The title bar shows the live frame rate, the window size, the size actually being traced, the
   samples per pixel and which backend is active - for example
   `1280x720 trace 2560x1440 - 12 spp`.
@@ -62,8 +67,10 @@ Options (all optional):
 | `--accum S` | samples accumulated per still, default 48 |
 | `--size WxH` | capture resolution, default 1280x720 |
 | `--out DIR` | capture output directory, default `captures` |
+| `--fullscreen` | start in fullscreen; Alt+Enter toggles it at any time |
 | `--quality MODE` | burden ceiling: `high` (2x supersampling), `balanced` (1.25x), `performance` (window size), `off` |
-| `--no-vsync` | present without waiting for the display (mailbox, else immediate). Shows the true render rate; tears |
+| `--no-vsync` | the default - present as soon as a frame is ready (mailbox, else immediate), with the loop paced to the panel rate by a high-resolution timer |
+| `--vsync` | wait for the display before presenting (FIFO). Off by default: FIFO queues pending presents and delivers unevenly once the loop runs ahead of the panel |
 | `--refresh N` | treat the panel as running at N Hz. Detected from the monitor at startup and logged |
 | `--scale F` | baseline trace resolution 0.4-1.0; adaptive quality measures against this (1.0 = the window's own size) |
 | `--no-auto-quality` | pin samples and scale instead of adapting to the GPU |

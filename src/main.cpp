@@ -51,7 +51,8 @@ static int realMain(int argc, char** argv) {
     bool cliAutoQuality = true, cliAutoGiven = false;
     float cliTargetFps = 0.f, cliMinScale = 0.f;
     int cliMaxSpp = 0;
-    bool cliVsync = true;
+    bool cliVsync = true, cliVsyncGiven = false;
+    bool cliFullscreen = false;
     float cliRefresh = 0.f;
     std::string cliQuality;
 
@@ -89,9 +90,12 @@ static int realMain(int argc, char** argv) {
         } else if (a == "--no-auto-quality") { cliAutoQuality = false; cliAutoGiven = true; }
         else if (a == "--target-fps") { cliTargetFps = float(atof(next("--target-fps"))); }
         else if (a == "--max-spp") { cliMaxSpp = atoi(next("--max-spp")); }
-        else if (a == "--no-vsync") { cliVsync = false; }
+        else if (a == "--no-vsync") { cliVsync = false; cliVsyncGiven = true; }
+        else if (a == "--vsync") { cliVsync = true; cliVsyncGiven = true; }
         else if (a == "--quality") { cliQuality = next("--quality"); }
         else if (a == "--refresh") { cliRefresh = float(atof(next("--refresh"))); }
+        else if (a == "--fullscreen") { cliFullscreen = true; }
+        else if (a == "--test-camera") { app.testCamera = true; }
         else if (a == "--min-scale") { cliMinScale = float(atof(next("--min-scale"))); } else if (a == "--compute") forceCompute = true;
         else if (a == "--rt") requireRt = true;
         else if (a == "--verbose" || a == "-v") app.verbose = true;
@@ -108,6 +112,7 @@ static int realMain(int argc, char** argv) {
     if (cliTargetFps > 0.f) app.cfg.targetFps = cliTargetFps;
     if (cliMaxSpp > 0) app.cfg.maxSamplesPerFrame = cliMaxSpp;
     if (!cliVsync) app.cfg.vsync = false;
+    if (cliVsyncGiven) app.cfg.vsync = cliVsync;
     if (!cliQuality.empty()) app.cfg.qualityMode = cliQuality;
     if (cliRefresh > 0.f) app.cfg.detectedRefresh = cliRefresh;  // overrides the measured panel rate
     if (cliMinScale > 0.f) app.cfg.minRenderScale = cliMinScale;
@@ -122,6 +127,8 @@ static int realMain(int argc, char** argv) {
         glfwWindowHint(GLFW_FOCUSED, GLFW_TRUE);
         app.window = glfwCreateWindow(winW, winH, "Vulkan Ray Tracer", nullptr, nullptr);
         if (!app.window) { glfwTerminate(); fail("could not create the window"); }
+        glfwSwapInterval(app.cfg.vsync ? 1 : 0);  // only meaningful if GLFW ever owns the swap chain
+        if (cliFullscreen) toggleFullscreen(&app);  // starts on the monitor's own mode
         glfwSwapInterval(1);  // FIFO presentation; the loop is VSync-paced
     } else {
         if (!glfwInit()) fail("glfwInit failed");  // volk/windowing shared init; no window created

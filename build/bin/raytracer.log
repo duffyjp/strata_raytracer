@@ -15,4 +15,6 @@ step: geometry and acceleration structures
 step: textures
 step: ray-tracing pipeline ready
 window 1280x720 - drag the border to resize, ESC to quit
-display: 60 Hz panel, targeting 60 fps, vsync on, quality mode high
+display: 60 Hz panel, targeting 60 fps, vsync off, quality mode high
+window: fullscreen (3840x2160)
+camera: free look (WASD to move, mouse to look; idle 10 s hands control back)

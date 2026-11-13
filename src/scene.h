@@ -123,10 +123,13 @@ struct SceneConfig {
     float qualityHeadroom = 0.26f;   // fraction of the frame left unused, for consistent pacing
     int maxSamplesPerFrame = 16;
     float minRenderScale = 0.4f;
-    // Presentation and burden. vsync is on by default (FIFO): without it the loop renders as fast as
-    // it can and tears. qualityMode bundles the burden limits so there is one knob to turn when the
-    // frame budget cannot be met comfortably: high, balanced, performance or off (no adapting).
-    bool vsync = true;
+    // Presentation and burden. Vsync defaults to off: waiting for the display puts a queue of
+    // pending presents between the frame and the screen, and that shows up as motion that feels
+    // rougher than the fps number. The loop is then paced by a timer to the panel rate instead, so
+    // frames are produced at the rate they can actually be shown. qualityMode bundles the burden
+    // limits so there is one knob to turn when the frame budget cannot be met: high, balanced,
+    // performance or off (no adapting).
+    bool vsync = false;
     std::string qualityMode = "high";
     float detectedRefresh = 0.f;   // read from the monitor at startup; 0 means fall back to targetFps
     int baseSamplesPerFrame = 4;
