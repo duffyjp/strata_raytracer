@@ -51,6 +51,41 @@ struct CpuInstance {
     InstanceTransform xf{};
 };
 
+// One adapter, as its own driver describes it. Every capability is read per adapter before anything
+// is chosen, and the winning adapter's snapshot is kept, because the two render paths need different
+// features while vkCreateDevice refuses the whole request the moment it is handed a feature the
+// adapter does not have. What the probe read back is therefore the only legal source for what the
+// device may be asked to enable - see createDevice().
+struct AdapterCaps {
+    VkPhysicalDevice dev = VK_NULL_HANDLE;
+    uint32_t index = 0;
+    VkPhysicalDeviceProperties props{};
+
+    // Feature sets exactly as reported: a member reads TRUE only where the adapter offers it.
+    VkPhysicalDeviceFeatures2 f2{};
+    VkPhysicalDeviceVulkan12Features f12{};
+    VkPhysicalDeviceVulkan13Features f13{};
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR asf{};
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtf{};
+    VkPhysicalDeviceRayQueryFeaturesKHR rqf{};
+
+    // The device extensions the two paths are built on.
+    bool extSwapchain = false;
+    bool extAccelStruct = false;
+    bool extRtPipeline = false;
+    bool extRayQuery = false;
+    bool extDeferredHostOps = false;
+    bool extPipelineLibrary = false;
+
+    bool core13 = false;               // the accelerated commands only exist once 1.3 is core
+    bool bufferDeviceAddress = false;  // both paths address their geometry buffers this way
+    bool accelStruct = false;          // extension and feature both present
+    bool presentable = true;           // false: cannot present the window that was asked for
+    bool canRt = false;                // path 1: the ray-tracing pipeline
+    bool canRq = false;                // path 2: the ray-query compute fallback
+    std::string whyNot;                // what is missing, for the log and for the error text
+};
+
 struct App {
     // core
     VkInstance instance = VK_NULL_HANDLE;
@@ -75,9 +110,14 @@ struct App {
     std::vector<VkFramebuffer> framebuffers;
     VkRenderPass renderPass = VK_NULL_HANDLE;
 
-    // capability choice
+    // capability choice, made at start-up from the adapter probe (see pickPhysicalDevice) and
+    // overridable for testing by --rt and --compute, which then refuse to run rather than quietly
+    // settling for the other path. `chosen` is the probe of the adapter physicalDevice refers to, and
+    // it is the only thing createDevice is allowed to ask that adapter for.
     bool usingComputeFallback = false;
-    bool wantRt = true;
+    bool forceRt = false;
+    bool forceCompute = false;
+    AdapterCaps chosen{};
 
     // scene
     MeshGpu meshes[4];
@@ -219,6 +259,12 @@ struct App {
     int filterCalBeforeSpp = 0;
     int filterCalWait = 0;
     int modelRejects = 0;             // readings refused as unsettled or as outliers
+    // Readings in which the modelled price of the filter came in above the frame that was measured, so
+    // the share charged to it had to be capped before the rest could be believed. Counted apart from
+    // the refusals above because they mean opposite things: a refusal throws a reading away, a cap
+    // keeps it and says which of its terms was not taken on trust. A run that caps on nearly every
+    // frame is a run whose filter has never been priced by a real flip.
+    int modelShareCaps = 0;
     bool filterCalibrated = false;    // at least one two-sided measurement backs the constant
     bool denoiseUserToggled = false;  // N was pressed: the user owns the switch for this run
     int liveSpp = 1;                // samples per pixel per frame in effect right now
@@ -272,6 +318,9 @@ struct App {
 // core.cpp
 extern FILE* g_logFile;  // always mirrored to a file: a GUI-subsystem binary has no console
 void logMsg(const char* fmt, ...);
+// True for the headless modes (--capture, --list-adapters): those must never raise the dialog fail()
+// otherwise shows, because an automated run would sit behind it.
+extern bool g_headlessMode;
 [[noreturn]] void fail(const char* fmt, ...);
 const char* vkResultName(VkResult r);
 VkResult vkCheck(const char* expr, VkResult r);
@@ -293,6 +342,8 @@ VkCommandBuffer beginOneTime(App* app);
 void endOneTime(App* app, VkCommandBuffer cmd);
 
 void pickPhysicalDevice(App* app);
+// The --list-adapters report: probe every adapter, log the matrix, create nothing.
+void logAdapterMatrix(App* app);
 void createDevice(App* app);
 void createInstance(App* app);
 void loadScene(App* app, const std::string& explicitPak);

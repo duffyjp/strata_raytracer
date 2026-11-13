@@ -1,0 +1,26 @@
+pak: \\ebay\Users\Jacob\Documents\Raytracer\build\bin\scene.pak (4 entries)
+scene.json applied
+adapter 0: NVIDIA GeForce GTX 1080 Ti               vulkan 1.4  rayTracing=yes rayQuery=no  bufferDeviceAddress=yes  usable=ray-tracing pipeline
+    missing: ray-query fallback: needs the VK_KHR_ray_query extension
+rendering on: NVIDIA GeForce GTX 1080 Ti  [ray-tracing pipeline]
+pipeline chosen by the adapter probe: ray-tracing pipeline
+device request: rayTracingPipeline=yes rayQuery=no accelerationStructure=yes bufferDeviceAddress=yes
+                plus: scalarBlockLayout=yes uniformBufferStandardLayout=yes hostQueryReset=yes descriptorIndexing=yes
+step: device + queues created
+step: command pool, sync objects, sampler
+  mesh sphere: uploading 1225 verts / 6912 indices
+  mesh cube: uploading 36 verts / 36 indices
+  mesh cone: uploading 576 verts / 576 indices
+  mesh disc: uploading 384 verts / 384 indices
+step: geometry and acceleration structures
+  texture from pak: textures/checker.png (128x128) -> slot 0
+  texture from pak: textures/emissive_ramp.png (64x8) -> slot 1
+step: textures
+step: ray-tracing pipeline ready
+window 1280x720 - drag the border to resize, ESC to quit
+display: 60 Hz panel, targeting 60 fps, vsync off, quality mode high
+quality start: denoise on, scale 1.00, spp 1, filter 0.86 ms per megapixel
+quality decision: denoise off (late fraction 0.50, scale 1.00, spp 1)
+denoise OFF (frames late: the filter is the first thing given up)
+  denoise cost: 4.49 ms per megapixel traced (8.7 ms for 1.94 MP, measured across the filter going off)
+quality decision: scale 1.00 -> 0.73 (gpu 17.2 ms, budget 9.2 ms)

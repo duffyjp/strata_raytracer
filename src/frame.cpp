@@ -398,14 +398,31 @@ static void toggleDenoise(App* app) {
 // sample cannot make the frame. That account is missing one line: the filter does not scale with the
 // sample count at all, so it is carried as its own term - see the cost model below.
 
-// What the display will actually deliver. Sizing the frame budget for 60 Hz when the panel runs at
-// 58 or 59 makes it slightly too big on every single frame: the number in the title bar still looks
-// fine, but the delivery is consistently on the edge, and that is felt as roughness.
+// The frame rate the run is held to. It is the rate that was asked for, and the panel gets exactly
+// one concession: a display running a little below its nominal rate (58 or 59.94 for a "60 Hz" mode)
+// makes a budget sized for exactly 60 slightly too big on every single frame - the number in the title
+// bar still looks fine, but the delivery is consistently on the edge, and that is felt as roughness -
+// so a detected rate close to the target is allowed to trim it toward the panel.
+//
+// What the panel may not do is redefine the target. What stood here was a std::min with the detected
+// rate, and on a machine whose primary display is a virtual one, a min hands the target to whatever
+// that device happens to be running. Measured on this one: the session's primary display is the
+// Microsoft Remote Display Adapter at 1280x800 @ 32 Hz, so a 60 fps target silently became a 31.25 ms
+// frame period and a 19.4 ms budget. Two things followed from that alone. The limiter at the foot of
+// the frame loop paces the renderer to this number, so a machine making a 1 ms frame delivered 31.5 fps
+// and every frame of the run was late against the target it had been given; and the controller, holding
+// more than twice the frame it was entitled to, spent the surplus on supersampling (scale 1.00 -> 2.00)
+// and never once concluded that anything had to be given up. Inferring the deadline from the environment
+// is the same defect as inferring it from the most common frame interval, one layer up, and it hides in
+// the log because the number looks plausible. A panel further away than a fifth of the target is a
+// different device, not a slower edition of the one that was asked for, and it does not get to set the
+// clock.
 static double effectiveFps(const SceneConfig& c)
 {
-    double want = double(c.targetFps);
-    if (c.detectedRefresh >= 20.0 && c.detectedRefresh <= 400.0) want = std::min(want, double(c.detectedRefresh));
-    return want > 0.0 ? want : 60.0;
+    const double want = c.targetFps > 0.0 ? double(c.targetFps) : 60.0;
+    const double panel = double(c.detectedRefresh);
+    if (panel >= 20.0 && panel <= 400.0 && panel < want && panel > 0.8 * want) return panel;
+    return want;
 }
 
 // One knob for "this machine cannot hold the frame": the bundles only move the ceiling and how much
@@ -639,11 +656,32 @@ void reportGpuFrameTime(App* app, double ms) {
 
     // Learn the trace's own unit cost from the measurement with the filter's share taken out - the
     // step that was missing, and the reason one constant had to stand in for two unrelated things.
-    const double traceMs = app->gpuMsAvg - model.filterOnly(app->liveScale);
-    // A reading the filter accounts for nearly all of says nothing about what tracing costs, and
-    // dividing by what is left would invent a unit cost out of the remainder. Those readings are
-    // refused rather than believed, and the refusal counted so it can be seen in the log.
-    if (traceMs > 0.15 * app->gpuMsAvg && tracedKilo > 0.0) {
+    //
+    // The filter's share is bounded by the frame it is charged against, because a part of a frame
+    // cannot cost more than the whole of it, and until a real flip has priced the filter the number
+    // being subtracted is a seeded starting value rather than a measurement. So a frame that comes in
+    // cheaper than the modelled price contradicts the seed, not itself. What stood here refused those
+    // readings outright, and on a fast machine that meant refusing almost all of them: measured here at
+    // one megapixel, where a whole frame costs 0.9 ms and the seed prices the filter alone at 0.86 ms,
+    // 192 readings were thrown away and the trace term learned nothing from any of the frames that were
+    // actually measured - the state this two-term model exists to avoid. Refusing a reading is
+    // legitimate while it is still settling or just after a reallocation, and both are dealt with above,
+    // before this point; it is also legitimate when what is left of the frame is too small for the
+    // timestamps to resolve. It is not legitimate merely because one of the model's own guesses does
+    // not fit. Capping the share here costs the trace term nothing it can prove wrong: the cap only
+    // ever applies to a filter share the frame itself has already contradicted.
+    double filterShare = model.filterOnly(app->liveScale);
+    if (filterShare > 0.5 * app->gpuMsAvg)
+    {
+        filterShare = 0.5 * app->gpuMsAvg;
+        // Counted rather than silent: a run capped on nearly every frame is a run whose filter has never
+        // been priced, and the number belongs next to the refusals in the log for exactly that reason.
+        ++app->modelShareCaps;
+    }
+    const double traceMs = app->gpuMsAvg - filterShare;
+    // A tenth of a millisecond is the floor below which the remainder is inside the resolution of the
+    // query and of the smoothing applied to it, and a unit cost divided off that is invented.
+    if (traceMs > 0.1 && tracedKilo > 0.0) {
         double unit = traceMs / (tracedKilo * double(app->liveSpp));
         if (app->msPerSampleKiloPx > 0.0) {
             unit = std::min(std::max(unit, app->msPerSampleKiloPx / 2.0),
@@ -713,14 +751,27 @@ void reportGpuFrameTime(App* app, double ms) {
     const bool missingVsync = app->cpuMsAvg > frameMs * 1.10 && nearBudget;
     if (missingVsync) app->cleanPaceStreak = 0; else ++app->cleanPaceStreak;
     const double spend = missingVsync ? budget * 0.85 : budget;
+    // Whether the frames are arriving on time, which is a separate question from whether the GPU is
+    // near its share of them: a machine can be cheap and deliver late anyway, and then the cheapness
+    // says nothing at all about what the next frame will feel like. Cheap-but-late is exactly the
+    // situation the ordering rule exists for, and the version this guards did not look at it: with 788
+    // frames in 789 arriving at twice the interval they were asked for, and with the filter still
+    // switched on and still the controller's to give up, it raised supersampling from scale 1.00 to
+    // 2.00 - the opposite of surrendering something. Nothing is bought while the delivery is late, and
+    // in the restore branch below, nothing is handed back either.
+    const bool deliveringLate = lateNow || lateFrac >= 0.25;
     // Spending up is not the same as spending down: a climb that lands exactly on the budget lands on
     // top of the measurement noise as well, and the next reading then says it is over. Leave a margin
     // when going up so the settle lands inside the deadband rather than on its edge.
     const double climbSpend = budget * kClimbMargin;
 
     // Hysteresis on delivery: spend up only when the pace has been clean for three quarters of a
-    // second, otherwise the measured cost and the delivered pace argue and the image flickers.
-    const bool settledPace = !missingVsync && app->cleanPaceStreak >= 45;
+    // second, otherwise the measured cost and the delivered pace argue and the image flickers - and
+    // never at all while the frames are arriving late, whatever the timestamps say they cost. Buying
+    // quality is a decision made for the frames that come next, and if those are already missing their
+    // target the next thing has to be given up, not bought. See deliveringLate above.
+    const bool settledPace =
+        !missingVsync && !deliveringLate && app->cleanPaceStreak >= 45;
     // Decide on streaks, not on single readings: a frame can be slow for reasons unrelated to the
     // scene (a background process, the compositor), and reacting to one such reading is exactly how
     // a controller ends up oscillating. Inside the band both streaks are cleared but control is not
@@ -782,6 +833,10 @@ void reportGpuFrameTime(App* app, double ms) {
 
     const int prevSpp = app->liveSpp;
     const float prevScale = app->liveScale;
+    // The measurement this decision is being reported against. It has to be saved here: a scale change
+    // below runs through invalidateQuality, which zeroes the smoothed average, and printing the live
+    // value afterwards logged "0.0 ms measured" for a frame that had just read 2.4 ms.
+    const double measuredMs = app->gpuMsAvg;
 
     // A change is not free - replacing the accumulation target costs a frame - so require that the
     // one being considered is worth it. Over budget, dropping is mandatory however small the step;
@@ -836,7 +891,17 @@ void reportGpuFrameTime(App* app, double ms) {
     // machine was missing its target, and taking it back while it is still missing that target -
     // however much the timestamps say the frame could afford it - is the flip that would be reversed
     // on the next late reading, which is the behaviour this ordering exists to remove.
+    // ...and priced. The flip that gave the filter up armed the only measurement of what the filter
+    // costs, and that pair completes fifteen readings later - three readings after the first decision
+    // window of the new state would otherwise open. On a machine whose frame turns cheap the instant the
+    // filter goes, the restore branch used to win that race: measured here at four megapixels, 24 ms with
+    // the filter and 1.6 ms without, and it took the filter back on the seeded 0.86 ms per megapixel
+    // while the truth at that size was 5.58 - the emergency decision undone a quarter of a second after
+    // it, at the price of two rebuilds and noise at both ends. That is the flap this whole ordering was
+    // written to end. Asking whether there is room for the whole of the filter's price is not a question
+    // that can be answered while the price is a guess, so it is not asked until one flip has answered it.
     if (!app->cfg.denoise && app->denoiseAutoOff && !app->denoiseUserToggled &&
+        app->filterCalibrated &&
         app->denoiseFlips < kMaxDenoiseFlips && !lateNow && !overBudget && settledPace &&
         nothingMoved) {
         const double withFilter = model.msAt(app->liveScale, app->liveSpp) +
@@ -854,10 +919,15 @@ void reportGpuFrameTime(App* app, double ms) {
     }
 
     if (app->verbose && (prevSpp != app->liveSpp || prevScale != app->liveScale))
-        logMsg("  quality: %.1f ms measured -> %d spp at scale %.2f (budget %.1f ms of %.1f, "
-               "change cost %.1f ms, filter %.2f ms/MP, model refused %d)\n",
-               app->gpuMsAvg, app->liveSpp, app->liveScale, spend, frameMs,
-               app->lastChangeCostMs, app->filterMsPerMegaPx, app->modelRejects);
+        // The period is spelled out next to the budget, and the reallocation's cost is labelled as wall
+        // time, because it is none of the GPU's: thirty images destroyed and rebuilt outside the
+        // timestamps, timed only so that the readings which follow it can be recognised as describing a
+        // half-built frame. Printed as "change cost" beside a GPU figure, it reads as part of the frame.
+        logMsg("  quality: %.1f ms measured -> %d spp at scale %.2f (budget %.1f ms of a %.1f ms "
+               "period, reallocation %.1f ms of wall time, filter %.2f ms/MP, model refused %d, model "
+               "share capped %d)\n",
+               measuredMs, app->liveSpp, app->liveScale, spend, frameMs, app->lastChangeCostMs,
+               app->filterMsPerMegaPx, app->modelRejects, app->modelShareCaps);
 }
 
 static void readAndReportGpuTime(App* app, int slotIdx) {
@@ -1058,10 +1128,22 @@ int runWindowed(App* app) {
     if (app->cfg.denoise && app->cfg.autoQuality) app->cfg.baseSamplesPerFrame = 1;
     GLFWmonitor* mon = glfwGetPrimaryMonitor();
     const GLFWvidmode* vm = mon ? glfwGetVideoMode(mon) : nullptr;
-    if (vm && vm->refreshRate > 0) app->cfg.detectedRefresh = float(vm->refreshRate);
+    // ...and only when nothing else supplied one. --refresh is applied before the frame loop is
+    // entered, so reading the monitor unconditionally here overwrote it: the flag whose whole job is
+    // to pin the panel rate for a measurement did nothing at all.
+    if (vm && vm->refreshRate > 0 && app->cfg.detectedRefresh <= 0.f)
+        app->cfg.detectedRefresh = float(vm->refreshRate);
     logMsg("display: %d Hz panel, targeting %.0f fps, vsync %s, quality mode %s\n",
            vm ? vm->refreshRate : 0, effectiveFps(app->cfg), app->cfg.vsync ? "on" : "off",
            app->cfg.qualityMode.c_str());
+    // Said out loud, because the number is easy to mistake for the target. A panel reporting a rate
+    // far from the one that was asked for is a different device - a virtual display adapter on a
+    // remote session, in the case this was found on - and it does not get to set the frame deadline.
+    const double panelHz = double(app->cfg.detectedRefresh);
+    if (panelHz >= 20.0 && panelHz <= 400.0 && effectiveFps(app->cfg) > panelHz + 0.5)
+        logMsg("  panel rate %.0f Hz is not the frame target: this run is held to %.0f fps, "
+               "the rate that was asked for (see effectiveFps)\n",
+               panelHz, effectiveFps(app->cfg));
     // Where the run starts from, stated rather than inferred: the controller's first move is
     // measured against this, and a test of the decisions needs to know what was on before any of
     // them were made.

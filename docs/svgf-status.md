@@ -810,3 +810,150 @@ samples-given-up-first, never-surrendering, staying-slow-after-surrendering, sur
 not, and starting-with-the-filter-off. A test that cannot fail is not evidence, and the real runs cannot
 be relied on to produce the wrong order on demand. The self-check earned its place immediately: it
 found an indexing bug in the test's own ordering assertion on the first run.
+
+## The 32 Hz panel that turned into the frame target, and the window that was not the window it asked for
+
+2026-11-13, afternoon. `tools/test_denoise_priority.py` failed on this machine after the adapter-capability
+rework landed. The rework was not the cause and none of it was reverted. Two independent facts about the
+session the run was made from, each of which the controller had been quietly trusting, were.
+
+The failure, as recorded at 11:16:
+
+    quality decision: scale 1.00 -> 2.00 (gpu 2.4 ms, budget 19.4 ms)
+    fb 1284x781 hdr 2568x1562 swap 1284x781 gpu 13.6 ms - 1 spp @ scale 2.00
+    auto-exit after 25.0 s: 789 frames (31.5 fps average) | frame interval 8.0..92.8 ms, mean 31.7, 788 over 20 ms
+    FAIL: no "quality decision: denoise off" line ... averaged 31.5 fps, want at least 50
+    ... budget 19.4 ms of 31.2 ... model refused 192
+
+### Cause, in the order the numbers came from
+
+1. **The frame period was the panel's, not the one that was asked for.** `effectiveFps()` computed
+   `std::min(cfg.targetFps, cfg.detectedRefresh)`, and `cfg.detectedRefresh` is read at the top of
+   `runWindowed` from `glfwGetVideoMode(glfwGetPrimaryMonitor())`. This machine's session primary display
+   is not the RTX PRO 5000's panel: it is the **Microsoft Remote Display Adapter at 1280x800 @ 32 Hz**
+   (`Get-CimInstance Win32_VideoController` reports 32 Hz current and 32 Hz max for it, while the NVIDIA
+   adapter sits at 3840x2160 @ 59 and drives no desktop in this session). So the target became 32 fps, the
+   period 31.25 ms, and the budget `max(1.5, 31.25*(1-0.30) - 2.5)` = 19.4 ms — the exact two numbers in
+   the failure line. The log now says so: `display: 32 Hz panel, targeting 60 fps` plus a line naming the
+   panel rate as not the target. This is the same defect as the histogram one that was fixed earlier, one
+   layer up: the deadline was inferred from the environment instead of from the request, and it looked
+   plausible in the log. `dtBins`/`paceFloorMs` had not come back — `app->lastFrameLate` is still computed
+   against `cfg.targetFps` in the frame loop, and nothing else infers a period.
+2. **The same number was pacing the renderer**, which is why 31.5 fps happened at all. The limiter at the
+   foot of the loop sleeps to `1/effectiveFps` when vsync is off, so the app deliberately produced 31.25 ms
+   frames: `per-frame ms: poll 31.0 ... gpu 0.9 ms` on a run whose whole command buffer cost 0.9 ms. Every
+   one of those frames is then late against the 20.8 ms lateness rule, which is the 788 of 789. The
+   renderer was late because it was told to be, by a 32 Hz figure it had taken from a virtual display.
+3. **The scale increase followed from the doubled frame.** With a 19.4 ms budget and a measured 0.9-2.4 ms
+   frame the controller was enormously under budget, so `mayClimb` and `settledPace` were both true and the
+   closed-form spend asked for `sqrt(19.4/1.12) = 4.2`, clamped to the 2.0 ceiling. Nothing on the climb
+   path looked at the delivered interval: a machine with 788 late frames in 789 and the filter still on was
+   allowed to buy more pixels.
+4. **The denoiser could not be surrendered**, because the give-up branch is gated on
+   `gpuMsAvg > budget * 1.04` = 20.1 ms and the frame read 2.4-13.6 ms. The gate was right; the budget
+   under it was twice as big as the frame the run was supposed to make.
+5. **"model refused 192" was the seeded filter price refusing ordinary frames.** The rule read
+   `traceMs = gpuMsAvg - filterOnly(scale)` and refused the reading unless `traceMs > 0.15 * gpuMsAvg`. At
+   this window size (see 6) the seed of 0.86 ms/MP charges 0.86 ms against a frame whose *total* measured
+   cost is 0.9-1.3 ms, so the remainder was 0.04-0.44 ms against a bar of 0.14-0.20 ms: most ordinary
+   readings were refused, and what refused them was the model's own unpriced guess, not settling and not a
+   reallocation. 192 refusals, both terms starved, exactly as suspected.
+6. **`--window 3840x2100` was not rendering 3840x2100.** The failing line `fb 1284x781` is the giveaway:
+   the window came back the size of the session's work area — one megapixel, an eighth of what was asked
+   for. At one megapixel on a Blackwell the filter costs about 0.5 ms/MP (measured: 0.49 and 0.55 ms/MP
+   across two flips at 0.92 MP, against the 0.5 ms/MP hand measurement in the earlier section), the whole
+   frame costs 0.9 ms against a 9.2 ms budget, and the correct decision is to surrender *nothing*. The
+   acceptance test's large case exists to catch a filter too expensive for a big window; it had stopped
+   being that. The clamp is the default maximum track size — the monitor's work area — and it held even
+   with the window position named explicitly; pinning the window's size limits to the requested size,
+   resizing under the pin and releasing it afterwards is what escapes it.
+
+### What changed
+
+    frame.cpp  effectiveFps(): the panel may trim the target only when it is within a fifth of it.
+             A detected 59.94 against a 60 target still trims, which was the original point; a 32 Hz
+             virtual display no longer gets to define the frame.
+    frame.cpp  runWindowed(): the monitor's refresh is read only when nothing supplied one, so --refresh
+             is not overwritten (it never worked: it was applied before this line ran). A run held to a
+             rate its panel does not have says so in the log.
+    frame.cpp  reportGpuFrameTime(): the filter's share is bounded by the frame it is charged against
+             (capped at half) before the trace term is learned from the remainder, and the refusal is now
+             only for a remainder under 0.1 ms. Refusals counted as before; caps counted separately,
+             because a run that caps every frame has an unpriced filter.
+    frame.cpp  deliveringLate = lateNow || lateFrac >= 0.25, and settledPace requires !deliveringLate: no
+             quality is bought, and in the restore branch none is handed back, while frames are late.
+    frame.cpp  the restore branch additionally requires filterCalibrated. It did not, and on a machine
+             whose frame turns cheap the moment the filter goes it won the race against the flip that
+             prices the filter (15 readings to price, 12 to decide) and put the filter back on the seeded
+             guess: given up at 24 ms for the frame, taken back a quarter of a second later, twice the
+             rebuilds for nothing. Asking whether there is room for the whole of the filter's price is not
+             answerable while the price is a guess.
+    frame.cpp  the verbose line prints the period beside the budget, labels the reallocation's cost as
+             wall time (it is not GPU time, and read beside it that is how it looked), and reports the
+             reading the decision was made from instead of the zeroed average a change leaves behind -
+             "0.0 ms measured" in the failure output was that artifact, not a measurement.
+    main.cpp   --window is honoured: a named size also names a position, and if the window manager sized
+             it anyway the size limits are pinned to the requested size, the resize repeated, and the
+             limits released. If the desktop still will not host it, the log says "asked for WxH, given
+             WxH" rather than leaving it to be inferred from a framebuffer line.
+    main.cpp   a refused command line exits 1 on stderr without the dialog. --rt --compute used to raise
+             the MessageBox and sit there until dismissed, so it never returned an exit code at all; the
+             dialog was added for a double-clicked run that fails after start-up, and it still does that
+             (verified below).
+
+Untouched, on purpose: `filterIsOursToGive`, the give-up branch and its gates, the flip-armed
+two-sided calibration and its factor-of-two clamp, `toggleDenoise`'s user veto in both directions,
+`lateFramesWindow` counted in the loop against `cfg.targetFps`, and all of the adapter-capability work
+including `--list-adapters` and the startup dialog. No `dtBins`, no `paceFloorMs`, no inferred period.
+
+### Before and after, on this machine
+
+    case                        before (11:16)                after
+    --window 3840x2100, 25 s    31.5 fps, 789 frames,         55.2 fps / 1380 frames and 55.1 fps /
+                                788 of 789 frames late,       1379 frames on the two recorded runs;
+                                no give-up, scale 1.00->2.00, denoise off FIRST (late fraction 0.42
+                                budget 19.4 of 31.2,          at scale 1.00, spp 1), then the filter
+                                model refused 192             priced at 11.83-12.57 ms/MP (95-101 ms
+                                                              for 8.06 MP), then samples 1 -> 3
+    --window 1280x720, 20 s     58.7 fps, denoiser kept       58.7 fps both runs, denoiser kept
+    model refusals              192                           0 (share caps counted separately)
+    budget at 60 fps target     19.4 ms of a 31.2 ms period   9.2 ms of a 16.7 ms period
+
+The give-up is now decided on a frame the machine genuinely cannot make: at 8.06 MP the filter costs
+101 ms of a 101 ms frame. It is not decided by jitter — before the window was honoured, it fired on
+about one run in three, triggered by the reallocation hitch after its own climb, which is not evidence
+of anything.
+
+Verification, all on the final build, all from this session: the acceptance test twice (both exit 0,
+self-check included); `--autoexit 6` exit 0 at 59.0 fps on the ray-tracing pipeline with the denoiser
+kept on at 1280x720; `--compute --autoexit 6` exit 0 at 58.9 fps on the ray-query path logging
+"denoise: unavailable on the ray-query fallback, disabled"; `--list-adapters` exit 0 with both adapters
+in the matrix and the Intel marked `usable=neither path`; `--capture 1 --accum 8 --size 640x360` exit 0,
+PNG written, "stills: denoiser left off", zero decision lines; `--rt --compute` exit 1 with the
+mutual-exclusion message; imports still SHELL32/KERNEL32/USER32/GDI32; no arguments still opens the
+window and renders. The restore branch still runs, with the calibration now in front of it: forced
+give-up at 1280x720 priced the filter at 0.49 ms/MP, bought samples to 16, then took the filter back
+with 4.0 ms of headroom and priced it again at 0.55.
+
+### What is not verified
+
+- **The GTX 1080 Ti machine (rayTracing=yes, rayQuery=no) cannot be retested from here.** Its correct
+  behaviour at 11:08 — `denoise off` first, `denoise cost: 4.49 ms per megapixel`, `budget 9.2 ms` — is
+  preserved in code and its log is kept at `docs/remote-1080ti-reference.log`, but nothing was run there.
+  What could differ: the window change only bites when the desktop will not host the requested size, and
+  if that machine's sizes already fit, nothing changes; and `effectiveFps` there saw a 60 Hz panel, which
+  the new rule treats exactly as the old one did.
+- **The MessageBox is proven to still fire, not proven to be visible.** A windowed start-up failure
+  (`--pak` pointed at a missing file) still leaves the process waiting rather than exiting, which is the
+  dialog blocking. Enumerating top-level windows from this session sees no window of the app's at all -
+  not the dialog and not the render window - so whether a human in front of the console would see the box
+  is not something this session can show.
+- **The filter is still carried as one price per megapixel and is not one.** This machine measured
+  0.49-0.55 ms/MP at 0.92 MP, and 4.24-12.57 ms/MP at 4.01-8.06 MP across runs, with the factor-of-two
+  per-flip clamp moving the number toward the truth one flip at a time. The ordering does not depend on
+  it - the give-up is gated on the measured frame time and on lateness, not on the model - but a
+  prediction about what the next setting will cost still inherits whatever the constant has not caught up
+  with, which is what the cliff section above said and remains true.
+- A machine that is over its budget while still delivering on time is a state this build has no answer
+  for: `mayReduce` is held shut while the filter is still the controller's to give, and the give-up wants
+  lateness. It did not occur in any run recorded here, and it was left alone rather than half-solved.

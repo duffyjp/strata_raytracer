@@ -1,8 +1,11 @@
-pak: C:\Users\Jacob\Documents\Raytracer\build\bin\scene.pak (4 entries)
+pak: \\ebay\Users\Jacob\Documents\Raytracer\build\bin\scene.pak (4 entries)
 scene.json applied
-adapter 0: NVIDIA RTX PRO 5000 Blackwell            vulkan 1.4  rayTracing=yes rayQuery=yes
-adapter 1: Intel(R) UHD Graphics 770                vulkan 1.3  rayTracing=no rayQuery=no
-rendering on: NVIDIA RTX PRO 5000 Blackwell  [ray-tracing pipeline]
+adapter 0: NVIDIA GeForce GTX 1080 Ti               vulkan 1.4  rayTracing=yes rayQuery=no  bufferDeviceAddress=yes  usable=ray-tracing pipeline
+    missing: ray-query fallback: needs the VK_KHR_ray_query extension
+rendering on: NVIDIA GeForce GTX 1080 Ti  [ray-tracing pipeline]
+pipeline chosen by the adapter probe: ray-tracing pipeline
+device request: rayTracingPipeline=yes rayQuery=no accelerationStructure=yes bufferDeviceAddress=yes
+                plus: scalarBlockLayout=yes uniformBufferStandardLayout=yes hostQueryReset=yes descriptorIndexing=yes
 step: device + queues created
 step: command pool, sync objects, sampler
   mesh sphere: uploading 1225 verts / 6912 indices
@@ -15,11 +18,10 @@ step: geometry and acceleration structures
 step: textures
 step: ray-tracing pipeline ready
 window 1280x720 - drag the border to resize, ESC to quit
-display: 32 Hz panel, targeting 32 fps, vsync off, quality mode high
+display: 60 Hz panel, targeting 60 fps, vsync off, quality mode high
 quality start: denoise on, scale 1.00, spp 1, filter 0.86 ms per megapixel
-window: fullscreen (1280x800)
-quality decision: scale 1.00 -> 2.00 (gpu 3.3 ms, budget 19.4 ms)
-quality decision: denoise off (late fraction 0.00, scale 2.00, spp 1)
-denoise OFF (frames late: the filter is the first thing given up)
-  denoise cost: 6.91 ms per megapixel traced (28.3 ms for 4.10 MP, measured across the filter going off)
-quality decision: samples 1 -> 16 (gpu 1.3 ms, budget 19.4 ms)
+denoise OFF (pressed N)
+  denoise cost: 4.84 ms per megapixel traced (4.5 ms for 0.92 MP, measured across the filter going off)
+denoise ON (pressed N)
+  denoise cost: 4.63 ms per megapixel traced (4.3 ms for 0.92 MP, measured across the filter going on)
+quality decision: scale 1.00 -> 0.80 (gpu 14.5 ms, budget 9.2 ms)

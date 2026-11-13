@@ -44,8 +44,14 @@ static void printHelp() {
         "                       frame N, as <dir>\accum_NNN.bin, for noise analysis\n"
         "  --max-spp N          most samples per pixel per frame it may spend     [8]\n"
         "  --min-scale F        smallest trace resolution it may fall back to     [0.40]\n"
-        "  --compute            force the ray-query compute fallback\n"
-        "  --rt                 require the ray-tracing pipeline (fail if absent)\n"
+        "  --compute            force the ray-query compute fallback; it fails outright when no adapter\n"
+        "                       here offers VK_KHR_ray_query instead of falling back to the other path\n"
+        "  --rt                 force the ray-tracing pipeline; it fails outright when no adapter here\n"
+        "                       offers VK_KHR_ray_tracing_pipeline. The two flags are mutually\n"
+        "                       exclusive, and with neither one the best path the machine actually has\n"
+        "                       is picked at start-up - no flag is needed to make it work\n"
+        "  --list-adapters      log every adapter, its capabilities and which path each can serve, then\n"
+        "                       exit without opening a window: the report to send from a remote machine\n"
         "  --verbose            extra logging (pak contents, buffer sizes)\n"
         "  --help               this text\n");
 }
@@ -64,6 +70,7 @@ static int realMain(int argc, char** argv) {
     int cliMaxSpp = 0;
     bool cliVsync = true, cliVsyncGiven = false;
     bool cliFullscreen = false;
+    bool cliListAdapters = false;  // probe and report every adapter, then exit: no window, no device
     int cliDenoise = 0;
     int cliWinW = 0, cliWinH = 0;  // 0 = not mentioned, 1 = --denoise, -1 = --no-denoise
     int cliFilterDebug = 0;
@@ -81,6 +88,16 @@ static int realMain(int argc, char** argv) {
         fopen_s(&g_logFile, (dir + "\\raytracer.log").c_str(), "w");
         if (!g_logFile) fopen_s(&g_logFile, "raytracer.log", "w");
     }
+
+    // A refused command line is answered on stderr, not with a dialog. fail() raises the dialog because
+    // this is a GUI-subsystem binary: double-clicked, it has no console, and a start-up failure looked
+    // like a window that appeared and vanished. But an argument error can only have been produced by
+    // somebody who just typed arguments, and they are looking at a terminal. It also made the flag
+    // rules untestable: --rt --compute raised a modal box, so the process sat there until a human
+    // dismissed it and never handed back an exit code at all - which is the same trap the headless
+    // modes below are excused from. This is turned back off as soon as the arguments have been read, so
+    // everything after them - the pak, the device, the window - still answers a failure with the dialog.
+    g_headlessMode = true;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -132,12 +149,33 @@ static int realMain(int argc, char** argv) {
         }
         else if (a == "--min-scale") { cliMinScale = float(atof(next("--min-scale"))); } else if (a == "--compute") forceCompute = true;
         else if (a == "--rt") requireRt = true;
+        else if (a == "--list-adapters") cliListAdapters = true;
         else if (a == "--verbose" || a == "-v") app.verbose = true;
         else fail("unknown option '%s' (try --help)", a.c_str());
     }
     if (forceCompute && requireRt) fail("--compute and --rt are mutually exclusive");
-    app.wantRt = !forceCompute;
+    app.forceRt = requireRt;
+    app.forceCompute = forceCompute;
     if (app.captureCount <= 0) app.captureCount = 0;
+    // From here on the dialog belongs to the run rather than to the command line: a scripted run (a
+    // capture, an adapter report) must never end up sitting behind a box nobody is there to click, and
+    // a windowed run that cannot start must never fail silently either.
+    g_headlessMode = app.captureCount > 0 || cliListAdapters;
+
+    // --list-adapters is a question about the GPU, not a render, so it runs ahead of the assets and
+    // ahead of any window: it then cannot fail for a reason that has nothing to do with the hardware
+    // being asked about. Initialise the loader, ask every adapter what it has, write the answer to the
+    // log, leave. That ordering is what makes it usable over a network share on a machine nobody is
+    // sitting in front of.
+    if (cliListAdapters) {
+        if (!glfwInit()) fail("glfwInit failed");
+        createInstance(&app);
+        logAdapterMatrix(&app);
+        if (g_logFile) fclose(g_logFile);
+        g_logFile = nullptr;  // flushed and released: this file is the whole report
+        glfwTerminate();
+        return 0;
+    }
 
     // 1. Assets first: the scene file may drive the window size and camera.
     loadScene(&app, pakPath);
@@ -174,7 +212,45 @@ static int realMain(int argc, char** argv) {
         glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
         glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
         glfwWindowHint(GLFW_FOCUSED, GLFW_TRUE);
+        // Name a position when the size was named, because leaving it to the window manager lets the
+        // desktop choose the size too: with CW_USEDEFAULT, Windows runs its default placement, and
+        // default placement shrinks any window larger than the work area down to the work area. Asked
+        // for a 3840x2100 window on a 1280x800 desktop - a remote session, a headless box, someone
+        // measuring the renderer at a size their panel does not have - the run silently got 1284x781,
+        // a ninth of the pixels, and everything downstream read from that: the budget, the cost model,
+        // the decisions, the fps. A window that hangs off the edge of the screen is a much better
+        // answer to a named size than a window that quietly becomes something else.
+        if (cliWinW > 0 && cliWinH > 0)
+        {
+            glfwWindowHint(GLFW_POSITION_X, app.winRect[0]);
+            glfwWindowHint(GLFW_POSITION_Y, app.winRect[1]);
+        }
         app.window = glfwCreateWindow(winW, winH, "Vulkan Ray Tracer", nullptr, nullptr);
+        if (app.window)
+        {
+            int gotW = 0, gotH = 0;
+            glfwGetWindowSize(app.window, &gotW, &gotH);
+            if (gotW != winW || gotH != winH)
+            {
+                // The window manager sized the window while it was being placed. The maximum track
+                // size a window starts with is its monitor's work area, so anything wider or taller
+                // than the screen came back shortened no matter what was asked for: 3840x2100 on this
+                // machine's 1280x800 remote session came back as 1284x781, an eighth of the pixels,
+                // and every number taken through that window - the frame budget, the pixel counts the
+                // cost model divides by, the decisions, the fps the run reports - described a render
+                // nobody asked for. Pin the track size to the size that was named, resize under the
+                // pin, then release it so dragging the border still works. A window hanging off the
+                // edge of the screen is the honest answer to a size the screen does not have; a window
+                // that quietly becomes something else is not an answer.
+                glfwSetWindowSizeLimits(app.window, winW, winH, winW, winH);
+                glfwSetWindowSize(app.window, winW, winH);
+                glfwSetWindowSizeLimits(app.window, GLFW_DONT_CARE, GLFW_DONT_CARE,
+                                        GLFW_DONT_CARE, GLFW_DONT_CARE);
+                glfwGetWindowSize(app.window, &gotW, &gotH);
+            }
+            if (gotW != winW || gotH != winH)
+                logMsg("window: asked for %dx%d, given %dx%d\n", winW, winH, gotW, gotH);
+        }
         if (!app.window) { glfwTerminate(); fail("could not create the window"); }
         glfwSwapInterval(app.cfg.vsync ? 1 : 0);  // only meaningful if GLFW ever owns the swap chain
         if (cliFullscreen) toggleFullscreen(&app);  // starts on the monitor's own mode

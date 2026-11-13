@@ -36,21 +36,36 @@ void logMsg(const char* fmt, ...) {
     fflush(stdout);
 }
 
+// Set by the headless modes (--capture, --list-adapters), which must never end up waiting on a
+// dialog nobody is there to click.
+bool g_headlessMode = false;
+
+// One formatted message, three destinations. The dialog is the point of the rewrite: this is a
+// GUI-subsystem binary, so a double-click has no console, stderr goes nowhere, and a start-up failure
+// looked like a window that appeared and then vanished - which is exactly how the refused
+// vkCreateDevice on the second machine presented itself. The log gets the line either way; a
+// scripted run (--capture, --list-adapters) gets no dialog so it can never hang.
 void fail(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "fatal: ");
-    vfprintf(stderr, fmt, ap);
+    char buf[2048];
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    buf[sizeof buf - 1] = '\0';
+
+    fprintf(stderr, "fatal: %s\n", buf);
+    fflush(stderr);
     if (g_logFile) {
-        va_end(ap);
-        va_start(ap, fmt);
-        fprintf(g_logFile, "fatal: ");
-        vfprintf(g_logFile, fmt, ap);
+        fprintf(g_logFile, "fatal: %s\n", buf);
         fflush(g_logFile);
     }
-    va_end(ap);
-    fputc('\n', stderr);
-    fflush(stderr);
+    if (!g_headlessMode) {
+        std::string msg(buf);
+        std::vector<wchar_t> wide(msg.size() + 2, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, msg.c_str(), -1, wide.data(), int(wide.size()));
+        MessageBoxW(nullptr, wide.data(), L"Vulkan Raytracer - start-up failed",
+                    MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+    }
     exit(1);
 }
 
@@ -354,79 +369,228 @@ void createInstance(App* app) {
 }
 
 // -------------------------------------------------------------------------------------------------
-// Device selection
-static bool deviceRtCaps(App* app, VkPhysicalDevice dev, bool* rt, bool* rq) {
-    VkPhysicalDeviceProperties p{};
-    vkGetPhysicalDeviceProperties(dev, &p);
+// Two render paths, decided per adapter at start-up:
+//
+//   ray-tracing pipeline   VK_KHR_acceleration_structure + VK_KHR_ray_tracing_pipeline
+//   ray-query fallback     VK_KHR_acceleration_structure + VK_KHR_ray_query
+//
+// Both need Vulkan 1.3 - the accelerated commands keep their _KHR spelling but only exist once 1.3 is
+// core - an acceleration structure, and bufferDeviceAddress. A driver is free to advertise one path
+// and not the other: a GTX 1080 Ti reports the ray-tracing pipeline without ray queries. So every
+// capability is queried per adapter and turned into two booleans, and what the device is later asked
+// to enable comes out of the winning adapter's own answers. Nothing downstream may assume more than
+// the probe confirmed.
+static const char* yesNo(bool b) { return b ? "yes" : "no"; }
 
-    VkPhysicalDeviceAccelerationStructureFeaturesKHR asf{};
-    asf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
-    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtf{};
-    rtf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
-    rtf.pNext = &asf;
-    VkPhysicalDeviceRayQueryFeaturesKHR rqf{};
-    rqf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
-    rqf.pNext = &rtf;
-    VkPhysicalDeviceVulkan12Features f12{};
-    f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-    f12.pNext = &rqf;
-    VkPhysicalDeviceFeatures2 f2{};
-    f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    f2.pNext = &f12;
-    vkGetPhysicalDeviceFeatures2(dev, &f2);
-
-    bool core13 = p.apiVersion >= VK_API_VERSION_1_3;
-    *rt = core13 && rtf.rayTracingPipeline && asf.accelerationStructure && f12.bufferDeviceAddress;
-    *rq = core13 && rqf.rayQuery && f12.bufferDeviceAddress;
-    return *rt || *rq;
+// What the ray-tracing pipeline still needs from this adapter, or nullptr when it needs nothing.
+static const char* rtMissing(const AdapterCaps& c) {
+    if (!c.core13) return "needs Vulkan 1.3";
+    if (!c.bufferDeviceAddress) return "needs bufferDeviceAddress";
+    if (!c.extAccelStruct) return "needs the VK_KHR_acceleration_structure extension";
+    if (!c.asf.accelerationStructure) return "needs the accelerationStructure feature";
+    if (!c.extRtPipeline) return "needs the VK_KHR_ray_tracing_pipeline extension";
+    if (!c.rtf.rayTracingPipeline) return "needs the rayTracingPipeline feature";
+    return nullptr;
 }
 
-void pickPhysicalDevice(App* app) {
+// The same question for the ray-query compute fallback.
+static const char* rqMissing(const AdapterCaps& c) {
+    if (!c.core13) return "needs Vulkan 1.3";
+    if (!c.bufferDeviceAddress) return "needs bufferDeviceAddress";
+    if (!c.extAccelStruct) return "needs the VK_KHR_acceleration_structure extension";
+    if (!c.asf.accelerationStructure) return "needs the accelerationStructure feature";
+    if (!c.extRayQuery) return "needs the VK_KHR_ray_query extension";
+    if (!c.rqf.rayQuery) return "needs the rayQuery feature";
+    return nullptr;
+}
+
+static const char* deviceTypeName(VkPhysicalDeviceType t) {
+    switch (t) {
+        case VK_PHYSICAL_DEVICE_TYPE_OTHER: return "other";
+        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return "integrated GPU";
+        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: return "discrete GPU";
+        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: return "virtual GPU";
+        case VK_PHYSICAL_DEVICE_TYPE_CPU: return "CPU";
+        default: return "unknown";
+    }
+}
+
+static void addWhy(AdapterCaps* c, const char* text) {
+    if (!c->whyNot.empty()) c->whyNot += " | ";
+    c->whyNot += text;
+}
+
+// Ask one adapter everything it knows. The chain hangs the promoted 1.2 and 1.3 aggregates off
+// VkPhysicalDeviceFeatures2 and then the three KHR feature structs, because the accelerated features
+// were never folded into the aggregates and have to be asked for by name.
+static void queryAdapterCaps(VkPhysicalDevice dev, uint32_t index, AdapterCaps* c) {
+    *c = AdapterCaps{};
+    c->dev = dev;
+    c->index = index;
+    vkGetPhysicalDeviceProperties(dev, &c->props);
+
+    c->f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    c->f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    c->f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    c->rtf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+    c->rqf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    c->asf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    c->f2.pNext = &c->f13;
+    c->f13.pNext = &c->f12;
+    c->f12.pNext = &c->rtf;
+    c->rtf.pNext = &c->rqf;
+    c->rqf.pNext = &c->asf;
+    vkGetPhysicalDeviceFeatures2(dev, &c->f2);
+
+    // TEMPORARY SIMULATION - DELETE: hides ray queries so this machine can stand in for a GTX 1080 Ti
+    // (ray-tracing pipeline yes, ray queries no).
+    if (getenv("RT_SIMULATE_NO_RAYQUERY")) c->rqf.rayQuery = VK_FALSE;
+
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(dev, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> exts(n);
+    vkEnumerateDeviceExtensionProperties(dev, nullptr, &n, exts.data());
+    auto has = [&](const char* name) {
+        for (const auto& e : exts)
+            if (strcmp(e.extensionName, name) == 0) return true;
+        return false;
+    };
+    c->extSwapchain = has(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    c->extAccelStruct = has(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+    c->extRtPipeline = has(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+    c->extRayQuery = has(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    c->extDeferredHostOps = has(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+    c->extPipelineLibrary = has(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+
+    c->core13 = c->props.apiVersion >= VK_API_VERSION_1_3;
+    c->bufferDeviceAddress = c->f12.bufferDeviceAddress != VK_FALSE;
+    c->accelStruct = c->extAccelStruct && c->asf.accelerationStructure != VK_FALSE;
+    c->canRt = rtMissing(*c) == nullptr;
+    c->canRq = rqMissing(*c) == nullptr;
+
+    // Say what is missing rather than only "no": a log carried in from another machine has to be
+    // enough on its own.
+    if (const char* w = rtMissing(*c)) {
+        std::string s = "ray-tracing pipeline: ";
+        s += w;
+        addWhy(c, s.c_str());
+    }
+    if (const char* w = rqMissing(*c)) {
+        std::string s = "ray-query fallback: ";
+        s += w;
+        addWhy(c, s.c_str());
+    }
+}
+
+// The one line per adapter the start-up log has always printed, with the two path verdicts added at
+// the end. In this line rayTracing and rayQuery name the paths, as they always have; the raw feature
+// bits are in the --list-adapters matrix below.
+static void logAdapterRow(const AdapterCaps& c) {
+    logMsg("adapter %u: %-40s vulkan %u.%u  rayTracing=%s rayQuery=%s  bufferDeviceAddress=%s  usable=%s\n",
+           c.index, c.props.deviceName, VK_VERSION_MAJOR(c.props.apiVersion),
+           VK_VERSION_MINOR(c.props.apiVersion), yesNo(c.canRt), yesNo(c.canRq),
+           yesNo(c.bufferDeviceAddress),
+           (c.canRt && c.canRq)   ? "both paths"
+                                  : c.canRt ? "ray-tracing pipeline"
+                                            : c.canRq ? "ray-query fallback" : "neither path");
+    if (!c.whyNot.empty()) logMsg("    missing: %s\n", c.whyNot.c_str());
+}
+
+// Enumerate and probe every adapter the loader knows about. Presentability only means something when a
+// window surface exists, so --list-adapters does not test it.
+static void queryAllAdapters(App* app, std::vector<AdapterCaps>* out) {
+    out->clear();
     uint32_t count = 0;
     VK_CHECK(vkEnumeratePhysicalDevices(app->instance, &count, nullptr));
     if (!count) fail("no Vulkan-capable GPU found");
     std::vector<VkPhysicalDevice> devices(count);
     VK_CHECK(vkEnumeratePhysicalDevices(app->instance, &count, devices.data()));
-
-    int best = -1, bestScore = -1000;
-    bool bestRt = false, bestRq = false;
+    out->resize(count);
 
     for (uint32_t i = 0; i < count; ++i) {
-        VkPhysicalDeviceProperties p{};
-        vkGetPhysicalDeviceProperties(devices[i], &p);
-
-        bool rt = false, rq = false;
-        deviceRtCaps(app, devices[i], &rt, &rq);
-        logMsg("adapter %u: %-40s vulkan %u.%u  rayTracing=%s rayQuery=%s\n", i, p.deviceName,
-               VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion), rt ? "yes" : "no",
-               rq ? "yes" : "no");
-
+        AdapterCaps& c = (*out)[i];
+        queryAdapterCaps(devices[i], i, &c);
         if (app->surface != VK_NULL_HANDLE) {
-            uint32_t qc = 0;
-            vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &qc, nullptr);
-            std::vector<VkQueueFamilyProperties> qs(qc);
-            vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &qc, qs.data());
-            bool presentable = false;
-            for (uint32_t q = 0; q < qc; ++q) {
-                VkBool32 ok = VK_FALSE;
-                vkGetPhysicalDeviceSurfaceSupportKHR(devices[i], q, app->surface, &ok);
-                if (ok && (qs[q].queueFlags & VK_QUEUE_GRAPHICS_BIT)) { presentable = true; break; }
+            c.presentable = false;
+            if (!c.extSwapchain) {
+                addWhy(&c, "VK_KHR_swapchain is absent, so it cannot present the window");
+            } else {
+                uint32_t qc = 0;
+                vkGetPhysicalDeviceQueueFamilyProperties(c.dev, &qc, nullptr);
+                std::vector<VkQueueFamilyProperties> qs(qc);
+                vkGetPhysicalDeviceQueueFamilyProperties(c.dev, &qc, qs.data());
+                for (uint32_t q = 0; q < qc; ++q) {
+                    VkBool32 ok = VK_FALSE;
+                    vkGetPhysicalDeviceSurfaceSupportKHR(c.dev, q, app->surface, &ok);
+                    if (ok && (qs[q].queueFlags & VK_QUEUE_GRAPHICS_BIT)) { c.presentable = true; break; }
+                }
+                if (!c.presentable) addWhy(&c, "no queue family can present the window surface");
             }
-            if (!presentable) continue;
         }
-
-        int score = 0;
-        if (app->wantRt && rt) score += 1000;
-        if (!app->wantRt && rq) score += 1000;
-        if (rq) score += 100;
-        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score += 50;
-        else if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) score += 10;
-        if (rt) score += 20;
-        if (score > bestScore) { bestScore = score; best = int(i); bestRt = rt; bestRq = rq; }
+        logAdapterRow(c);
     }
-    if (best < 0) fail("no usable Vulkan device found");
+}
 
-    app->physicalDevice = devices[best];
+// The best adapter that can serve one path, considering all of them. A discrete GPU wins when more
+// than one adapter can render the path, and equal scores keep the lower-numbered adapter, because a
+// score is only replaced when it is beaten outright.
+static int bestAdapter(const std::vector<AdapterCaps>& caps, bool wantRt) {
+    int best = -1, bestScore = 0;
+    for (const AdapterCaps& c : caps) {
+        if (!c.presentable || !(wantRt ? c.canRt : c.canRq)) continue;
+        int score = 0;
+        if (c.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score = 50;
+        else if (c.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) score = 10;
+        if (best < 0 || score > bestScore) { bestScore = score; best = int(c.index); }
+    }
+    return best;
+}
+
+// Decide which adapter renders, and by which path. Automatic: the ray-tracing pipeline wherever some
+// adapter here has it, otherwise the ray-query fallback wherever some adapter has that, and only then
+// a refusal naming what each adapter lacks. --rt and --compute narrow the choice to one path, and
+// then fail loudly instead of falling back to the other one.
+static bool chooseAdapter(App* app, const std::vector<AdapterCaps>& caps, int* out, bool* useRt,
+                          std::string* why) {
+    if (app->forceRt || app->forceCompute) {
+        const bool wantRt = app->forceRt;
+        const int i = bestAdapter(caps, wantRt);
+        if (i < 0) {
+            *why = wantRt
+                       ? "the ray-tracing pipeline needs VK_KHR_ray_tracing_pipeline and "
+                         "VK_KHR_acceleration_structure, which this adapter does not support (--rt)"
+                       : "the compute fallback needs VK_KHR_ray_query, which this adapter does not "
+                         "support (--compute)";
+            return false;
+        }
+        *out = i;
+        *useRt = wantRt;
+        return true;
+    }
+
+    int i = bestAdapter(caps, true);
+    if (i < 0) i = bestAdapter(caps, false);
+    if (i < 0) {
+        *why = "no adapter here can render this scene: neither VK_KHR_ray_tracing_pipeline nor "
+               "VK_KHR_ray_query is available (the adapter lines above say what each one lacks)";
+        return false;
+    }
+    *out = i;
+    *useRt = caps[size_t(i)].canRt;
+    return true;
+}
+
+void pickPhysicalDevice(App* app) {
+    std::vector<AdapterCaps> caps;
+    queryAllAdapters(app, &caps);
+
+    int chosen = -1;
+    bool useRt = false;
+    std::string why;
+    if (!chooseAdapter(app, caps, &chosen, &useRt, &why)) fail("%s", why.c_str());
+
+    app->chosen = caps[size_t(chosen)];
+    app->physicalDevice = app->chosen.dev;
     vkGetPhysicalDeviceProperties(app->physicalDevice, &app->props);
 
     app->asProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
@@ -437,13 +601,61 @@ void pickPhysicalDevice(App* app) {
     p2.pNext = &app->asProps;
     vkGetPhysicalDeviceProperties2(app->physicalDevice, &p2);
 
-    app->usingComputeFallback = app->wantRt ? !bestRt : true;
-    if (app->usingComputeFallback && !bestRq)
-        fail("%s supports neither VK_KHR_ray_tracing_pipeline nor VK_KHR_ray_query",
-             app->props.deviceName);
+    app->usingComputeFallback = !useRt;
 
     logMsg("rendering on: %s  [%s]\n", app->props.deviceName,
            app->usingComputeFallback ? "ray-query compute path" : "ray-tracing pipeline");
+    logMsg("pipeline chosen by %s: %s\n",
+           (app->forceRt || app->forceCompute) ? "the command line" : "the adapter probe",
+           app->usingComputeFallback ? "ray-query compute fallback" : "ray-tracing pipeline");
+}
+
+// --list-adapters: everything these drivers say about themselves, in the log, with no window and no
+// device created. It is the tool for a machine nobody is sitting in front of - one small text file
+// comes back and it already says which path that machine would pick, and what a card that cannot
+// serve either path is missing.
+void logAdapterMatrix(App* app) {
+    std::vector<AdapterCaps> caps;
+    queryAllAdapters(app, &caps);
+
+    int chosen = -1;
+    bool useRt = false;
+    std::string why;
+    const bool ok = chooseAdapter(app, caps, &chosen, &useRt, &why);
+
+    logMsg("adapter matrix: %u adapter(s); no window is opened, so presentation is not tested\n",
+           uint32_t(caps.size()));
+    if (app->forceRt || app->forceCompute)
+        logMsg("  (%s is in effect, so the choice below reflects the flag, not the default)\n",
+               app->forceRt ? "--rt" : "--compute");
+    for (const AdapterCaps& c : caps) {
+        logMsg("adapter %u: %s\n", c.index, c.props.deviceName);
+        logMsg("    type                 : %s\n", deviceTypeName(c.props.deviceType));
+        logMsg("    vulkan               : %u.%u.%u\n", VK_VERSION_MAJOR(c.props.apiVersion),
+               VK_VERSION_MINOR(c.props.apiVersion), VK_VERSION_PATCH(c.props.apiVersion));
+        logMsg("    extensions           : accel_structure=%s ray_tracing_pipeline=%s ray_query=%s\n",
+               yesNo(c.extAccelStruct), yesNo(c.extRtPipeline), yesNo(c.extRayQuery));
+        logMsg("                           deferred_host_ops=%s pipeline_library=%s swapchain=%s\n",
+               yesNo(c.extDeferredHostOps), yesNo(c.extPipelineLibrary), yesNo(c.extSwapchain));
+        logMsg("    features             : bufferDeviceAddress=%s accelerationStructure=%s\n",
+               yesNo(c.bufferDeviceAddress), yesNo(c.asf.accelerationStructure));
+        logMsg("                           rayTracingPipeline=%s rayQuery=%s\n",
+               yesNo(c.rtf.rayTracingPipeline), yesNo(c.rqf.rayQuery));
+        logMsg("                           descriptorIndexing=%s scalarBlockLayout=%s\n",
+               yesNo(c.f12.descriptorIndexing), yesNo(c.f12.scalarBlockLayout));
+        logMsg("    path ray-tracing     : %s\n", c.canRt ? "usable" : "not usable");
+        logMsg("    path ray-query       : %s\n", c.canRq ? "usable" : "not usable");
+        if (!c.whyNot.empty()) logMsg("    missing              : %s\n", c.whyNot.c_str());
+        logMsg("    selected             : %s\n",
+               (ok && chosen == int(c.index))
+                   ? (useRt ? "yes - ray-tracing pipeline" : "yes - ray-query compute fallback")
+                   : "no");
+    }
+    if (ok)
+        logMsg("result: adapter %d (%s)  [%s]\n", chosen, caps[size_t(chosen)].props.deviceName,
+               useRt ? "ray-tracing pipeline" : "ray-query compute path");
+    else
+        logMsg("result: nothing here can render the scene - %s\n", why.c_str());
 }
 
 void createDevice(App* app) {
@@ -483,63 +695,193 @@ void createDevice(App* app) {
     qi.queueCount = 1;
     qi.pQueuePriorities = &prio;
 
+    // vkCreateDevice treats the pNext chain as a list of demands. The rule the spec states is that the
+    // call fails with VK_ERROR_FEATURE_NOT_PRESENT if any member of any feature struct in the chain is
+    // VK_TRUE and the adapter does not report that feature, while VK_FALSE is always accepted. So the
+    // chain is built out of what the probe of THIS adapter answered, never out of a fixed wish list,
+    // and a struct for a capability the adapter does not offer is left out of the chain entirely:
+    // clearing its members would already be accepted, but sending a driver a feature struct for an
+    // extension we are not enabling either only invites it to be strict about something that should
+    // never have been sent.
+    //
+    // This is the whole of the failure being fixed. The ray-tracing path used to chain
+    // VkPhysicalDeviceRayQueryFeaturesKHR{rayQuery = VK_TRUE} in front of the acceleration-structure
+    // struct whatever the hardware said, so an adapter that offers the ray-tracing pipeline but not
+    // ray queries - a GTX 1080 Ti - had its device refused over a feature the path it was picked for
+    // does not even use. VkPhysicalDeviceVulkan12Features{descriptorIndexing = VK_TRUE} sat in the
+    // same chain and was the second candidate: nothing here binds a descriptor update-after-bind, so
+    // there was no need to ask for it at all.
+    const AdapterCaps& cap = app->chosen;
+
+    // TEMPORARY SELF-TEST - DELETE. What does a driver do with a feature struct in a vkCreateDevice
+    // chain that asks for something the adapter does not offer? That is the GTX 1080 Ti question. Two
+    // probes:
+    //   (a) an EXTENSION feature the Intel UHD 770 lacks, asked of it while the extension is not
+    //       enabled;
+    //   (b) a CORE feature this machine genuinely lacks, asked of the adapter in use. No extension is
+    //       involved, so a refusal there can only be the feature request itself being rejected.
+    if (getenv("RT_SELFTEST_FNP")) {
+        uint32_t tn = 0;
+        vkEnumeratePhysicalDevices(app->instance, &tn, nullptr);
+        std::vector<VkPhysicalDevice> devs(tn);
+        vkEnumeratePhysicalDevices(app->instance, &tn, devs.data());
+        for (uint32_t i = 0; i < tn; ++i) {
+            AdapterCaps t{};
+            queryAdapterCaps(devs[i], i, &t);
+            if (t.asf.accelerationStructure) continue;
+            logMsg("selftest a: adapter %u (%s) reports accelerationStructure=no\n", i, t.props.deviceName);
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                VkPhysicalDeviceAccelerationStructureFeaturesKHR probe{};
+                probe.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+                probe.accelerationStructure = attempt ? VK_TRUE : VK_FALSE;
+                VkDeviceCreateInfo d{};
+                d.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+                d.pNext = &probe;
+                VkDevice out = VK_NULL_HANDLE;
+                VkResult r = vkCreateDevice(devs[i], &d, nullptr, &out);
+                logMsg("selftest a: %s accelerationStructure -> %s (%d)\n",
+                       attempt ? "requesting   " : "not requesting", vkResultName(r), int(r));
+                if (out != VK_NULL_HANDLE) vkDestroyDevice(out, nullptr);
+            }
+        }
+
+        VkPhysicalDeviceFeatures2 base{};
+        base.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        vkGetPhysicalDeviceFeatures2(app->physicalDevice, &base);
+        auto coreFeatureOff = [&](int i) -> const char* {
+            switch (i) {
+                case 0: return base.features.textureCompressionETC2 == VK_FALSE ? "textureCompressionETC2" : nullptr;
+                case 1: return base.features.textureCompressionASTC_LDR == VK_FALSE ? "textureCompressionASTC_LDR" : nullptr;
+                case 2: return base.features.alphaToOne == VK_FALSE ? "alphaToOne" : nullptr;
+                case 3: return base.features.shaderStorageImageReadWithoutFormat == VK_FALSE
+                               ? "shaderStorageImageReadWithoutFormat" : nullptr;
+                case 4: return base.features.geometryShader == VK_FALSE ? "geometryShader" : nullptr;
+                case 5: return base.features.tessellationShader == VK_FALSE ? "tessellationShader" : nullptr;
+                default: return nullptr;
+            }
+        };
+        auto forceCoreFeature = [&](VkPhysicalDeviceFeatures& f, const char* name) {
+            if (!strcmp(name, "textureCompressionETC2")) f.textureCompressionETC2 = VK_TRUE;
+            else if (!strcmp(name, "textureCompressionASTC_LDR")) f.textureCompressionASTC_LDR = VK_TRUE;
+            else if (!strcmp(name, "alphaToOne")) f.alphaToOne = VK_TRUE;
+            else if (!strcmp(name, "shaderStorageImageReadWithoutFormat")) f.shaderStorageImageReadWithoutFormat = VK_TRUE;
+            else if (!strcmp(name, "geometryShader")) f.geometryShader = VK_TRUE;
+            else f.tessellationShader = VK_TRUE;
+        };
+        const char* coreName = nullptr;
+        for (int i = 0; i < 6 && !coreName; ++i) coreName = coreFeatureOff(i);
+        if (!coreName) {
+            logMsg("selftest b: every probed core feature is supported, nothing to probe\n");
+        } else {
+            logMsg("selftest b: %s is reported unsupported on %s; a throwaway device asks for it anyway\n",
+                   coreName, cap.props.deviceName);
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                VkPhysicalDeviceFeatures2 want{};
+                want.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                want.features = base.features;
+                if (attempt) forceCoreFeature(want.features, coreName);
+                VkDeviceCreateInfo d{};
+                d.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+                d.pNext = &want;
+                d.queueCreateInfoCount = 1;
+                d.pQueueCreateInfos = &qi;
+                VkDevice out = VK_NULL_HANDLE;
+                VkResult r = vkCreateDevice(app->physicalDevice, &d, nullptr, &out);
+                logMsg("selftest b: attempt %d %s %s -> %s (%d)\n", attempt,
+                       attempt ? "(requesting)   " : "(not requesting)", coreName, vkResultName(r), int(r));
+                if (out != VK_NULL_HANDLE) vkDestroyDevice(out, nullptr);
+            }
+        }
+    }
+
     VkPhysicalDeviceVulkan12Features f12{};
     f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-    f12.bufferDeviceAddress = VK_TRUE;
-    f12.scalarBlockLayout = VK_TRUE;
-    f12.descriptorIndexing = VK_TRUE;
-    f12.uniformBufferStandardLayout = VK_TRUE;
-    f12.hostQueryReset = VK_TRUE;
+    f12.bufferDeviceAddress = cap.f12.bufferDeviceAddress;  // both paths address buffers this way
+    f12.scalarBlockLayout = cap.f12.scalarBlockLayout;
+    f12.uniformBufferStandardLayout = cap.f12.uniformBufferStandardLayout;
+    f12.hostQueryReset = cap.f12.hostQueryReset;
+    // Asked for only where it is offered, for the reason above: it is a member an older card is
+    // likeliest to lack, and requesting it regardless would reproduce the ray-query failure one
+    // feature over.
+    f12.descriptorIndexing = cap.f12.descriptorIndexing;
 
     VkPhysicalDeviceAccelerationStructureFeaturesKHR asf{};
     asf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
-    asf.accelerationStructure = VK_TRUE;
-    asf.pNext = &f12;
-
-    VkPhysicalDeviceRayQueryFeaturesKHR rqf{};
-    rqf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
-    rqf.rayQuery = VK_TRUE;
-    rqf.pNext = &asf;
+    // Both paths build acceleration structures on the device; host builds are never used, and
+    // descriptors are written normally, so the other members of this struct stay FALSE.
+    asf.accelerationStructure = cap.asf.accelerationStructure;
 
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtf{};
     rtf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
-    rtf.rayTracingPipeline = VK_TRUE;
-    rtf.pNext = &rqf;
+    rtf.rayTracingPipeline = cap.rtf.rayTracingPipeline;
 
-    void* chain = app->usingComputeFallback ? (void*)&rqf : (void*)&rtf;
+    VkPhysicalDeviceRayQueryFeaturesKHR rqf{};
+    rqf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    rqf.rayQuery = cap.rqf.rayQuery;
 
-    // The acceleration-structure / ray-tracing commands keep their _KHR spelling after promotion
-    // into Vulkan 1.3, and the loader only hands out those entry points when the extension is
-    // enabled - so enable them explicitly (verified: without this the pointers come back NULL).
-    uint32_t devExtCount = 0;
-    vkEnumerateDeviceExtensionProperties(app->physicalDevice, nullptr, &devExtCount, nullptr);
-    std::vector<VkExtensionProperties> devExts(devExtCount);
-    vkEnumerateDeviceExtensionProperties(app->physicalDevice, nullptr, &devExtCount, devExts.data());
-    auto supported = [&](const char* name) {
-        for (const auto& e : devExts)
-            if (strcmp(e.extensionName, name) == 0) return true;
-        return false;
-    };
+    // Only the struct the path in use needs goes in, plus the acceleration structure and the 1.2
+    // aggregate. No VkPhysicalDeviceVulkan13Features struct is passed at all, because the renderer uses
+    // no feature gated by 1.3; if that ever changes, its members come from cap.f13 exactly the same
+    // way. The per-extension structs for features that 1.2 promoted must not accompany the aggregate
+    // struct, which is why bufferDeviceAddress and the rest are requested through f12 and nowhere
+    // else.
+    //
+    // VkBaseOutStructure is what the spec provides for walking a chain: every struct in one starts with
+    // sType and then pNext, so the shared prefix can be addressed through it.
+    VkBaseOutStructure* chain[3];
+    size_t chainCount = 0;
+    if (app->usingComputeFallback)
+        chain[chainCount++] = reinterpret_cast<VkBaseOutStructure*>(&rqf);
+    else
+        chain[chainCount++] = reinterpret_cast<VkBaseOutStructure*>(&rtf);
+    chain[chainCount++] = reinterpret_cast<VkBaseOutStructure*>(&asf);
+    chain[chainCount++] = reinterpret_cast<VkBaseOutStructure*>(&f12);
+    for (size_t i = 0; i + 1 < chainCount; ++i) chain[i]->pNext = chain[i + 1];
+    chain[chainCount - 1]->pNext = nullptr;
 
+    // The extensions are gated the same way as the features: only what the path in use traces, and
+    // only what this adapter offers. The KHR ray-tracing API adds no queue flag of its own, but its
+    // commands keep their _KHR spelling after the promotion into 1.3 and the loader only hands those
+    // entry points out when the extension is enabled, so the ones the chosen path needs have to be
+    // here (verified: without this the pointers come back NULL).
     std::vector<const char*> exts;
-    exts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-    const char* rtExts[] = {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
-                            VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
-                            VK_KHR_RAY_QUERY_EXTENSION_NAME,
-                            VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
-                            VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME};
-    for (const char* e : rtExts)
-        if (supported(e)) exts.push_back(e);
+    if (cap.extSwapchain) exts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    exts.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+    if (app->usingComputeFallback) {
+        if (cap.extRayQuery) exts.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    } else {
+        if (cap.extRtPipeline) exts.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+    }
+    if (cap.extDeferredHostOps)
+        exts.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);  // required by the AS extension
+    if (cap.extPipelineLibrary) exts.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+
+    // The request, in the log before it is made: if a driver still refuses, the machine's own file
+    // says which features were asked of it.
+    logMsg("device request: rayTracingPipeline=%s rayQuery=%s accelerationStructure=%s bufferDeviceAddress=%s\n",
+           yesNo(!app->usingComputeFallback && rtf.rayTracingPipeline != VK_FALSE),
+           yesNo(app->usingComputeFallback && rqf.rayQuery != VK_FALSE),
+           yesNo(asf.accelerationStructure != VK_FALSE), yesNo(f12.bufferDeviceAddress != VK_FALSE));
+    logMsg("                plus: scalarBlockLayout=%s uniformBufferStandardLayout=%s hostQueryReset=%s descriptorIndexing=%s\n",
+           yesNo(f12.scalarBlockLayout != VK_FALSE),
+           yesNo(f12.uniformBufferStandardLayout != VK_FALSE), yesNo(f12.hostQueryReset != VK_FALSE),
+           yesNo(f12.descriptorIndexing != VK_FALSE));
 
     VkDeviceCreateInfo di{};
     di.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    di.pNext = chain;
+    di.pNext = chain[0];
     di.queueCreateInfoCount = 1;
     di.pQueueCreateInfos = &qi;
     di.enabledExtensionCount = uint32_t(exts.size());
     di.ppEnabledExtensionNames = exts.data();
 
-    VK_CHECK(vkCreateDevice(app->physicalDevice, &di, nullptr, &app->device));
+    const VkResult created = vkCreateDevice(app->physicalDevice, &di, nullptr, &app->device);
+    if (created != VK_SUCCESS)
+        // Every member of that chain came back from this adapter's own feature query, so a refusal now
+        // means the combination is what the driver objects to rather than a capability it never had.
+        // The two lines above are the request, which is what a remote diagnosis needs.
+        fail("vkCreateDevice on %s failed: %s (%d) - the request logged above contains only features this adapter reported",
+             cap.props.deviceName, vkResultName(created), int(created));
     volkLoadDevice(app->device);
     vkGetDeviceQueue(app->device, app->queueFamily, 0, &app->queue);
 

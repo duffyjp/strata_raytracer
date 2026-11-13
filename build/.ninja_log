@@ -1,5 +1,5 @@
 # ninja log v7
-20	39	8162875044584338	C:/Users/Jacob/Documents/Raytracer/build/CMakeFiles/cmake.verify_globs	b9d44c5d60a8335c
+18	37	8162950834114369	C:/Users/Jacob/Documents/Raytracer/build/CMakeFiles/cmake.verify_globs	b9d44c5d60a8335c
 96	397	8162482168977509	third_party/glfw/src/CMakeFiles/glfw.dir/null_monitor.c.obj	c6cb3b9b9c848203
 73	409	8162482168768247	third_party/glfw/src/CMakeFiles/glfw.dir/vulkan.c.obj	eabfc94e71a1c39e
 68	433	8162482168694097	third_party/glfw/src/CMakeFiles/glfw.dir/platform.c.obj	118fe5c78103a776
@@ -27,11 +27,11 @@
 43	1588	8162522570125723	generated/shaders_spv.h	b133b2f322f13e9d
 43	1588	8162522570125723	C:/Users/Jacob/Documents/Raytracer/build/generated/shaders_spv.h	b133b2f322f13e9d
 1423	1956	8162482182242843	CMakeFiles/raytracer.dir/src/json.cpp.obj	eb8b5673911bfd9e
-51	505	8162875044900250	CMakeFiles/raytracer.dir/src/core2.cpp.obj	1b4dcb660b29f13
+450	1116	8162942455059365	CMakeFiles/raytracer.dir/src/core2.cpp.obj	1b4dcb660b29f13
 1418	2171	8162482182162578	CMakeFiles/raytracer.dir/src/pak.cpp.obj	69e1d01c69043a78
 65	733	8162825483126620	CMakeFiles/raytracer.dir/src/scene.cpp.obj	796ff35e195c6cc7
-44	1270	8162875044827508	CMakeFiles/raytracer.dir/src/main.cpp.obj	c0cf2b1294523021
-56	1230	8162875044945775	CMakeFiles/raytracer.dir/src/frame.cpp.obj	ff8e56f7d445ca1c
-48	1266	8162875044863806	CMakeFiles/raytracer.dir/src/core.cpp.obj	169fb734c5807656
-1270	1398	8162875057085822	bin/raytracer.exe	f80210f49cc6e55a
-19	39	8162875272647814	C:/Users/Jacob/Documents/Raytracer/build/CMakeFiles/cmake.verify_globs	b9d44c5d60a8335c
+42	1068	8162950834275183	CMakeFiles/raytracer.dir/src/main.cpp.obj	c0cf2b1294523021
+44	968	8162950194241270	CMakeFiles/raytracer.dir/src/frame.cpp.obj	ff8e56f7d445ca1c
+445	1736	8162942455059365	CMakeFiles/raytracer.dir/src/core.cpp.obj	169fb734c5807656
+1069	1195	8162950844679938	bin/raytracer.exe	f80210f49cc6e55a
+18	38	8162954131287757	C:/Users/Jacob/Documents/Raytracer/build/CMakeFiles/cmake.verify_globs	b9d44c5d60a8335c
