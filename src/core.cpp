@@ -246,6 +246,13 @@ void endOneTime(App* app, VkCommandBuffer cmd) {
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
     VK_CHECK(vkQueueSubmit(app->queue, 1, &si, VK_NULL_HANDLE));
+    if (app->deferOneTime) {
+        // Deliberately not waiting: everything here runs on one queue in submit order, so the frame
+        // that follows still sees this work completed. Waiting would drain the queue - including the
+        // pending present - and stall the window.
+        app->retiredCmd.push_back(cmd);
+        return;
+    }
     VK_CHECK(vkQueueWaitIdle(app->queue));
     vkFreeCommandBuffers(app->device, app->cmdPool, 1, &cmd);
 }
@@ -975,7 +982,10 @@ void writeTraceDescriptors(App* app, int slotIdx) {
     hdrInfo.imageView = app->hdr[slotIdx].view;
     hdrInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     VkDescriptorImageInfo presentInfo{};
-    presentInfo.imageView = app->hdr[slotIdx].view;
+    // While a quality change is taking effect, show the previous complete frame rather than the
+    // newly allocated (and not yet traced) target.
+    presentInfo.imageView = app->holdPending[slotIdx] ? app->hold[slotIdx].view
+                                                      : app->hdr[slotIdx].view;
     presentInfo.sampler = app->sampler;
     presentInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 

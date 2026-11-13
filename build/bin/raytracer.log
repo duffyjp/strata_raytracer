@@ -15,3 +15,4 @@ step: geometry and acceleration structures
 step: textures
 step: ray-tracing pipeline ready
 window 1280x720 - drag the border to resize, ESC to quit
+auto-exit after 6.0 s: 361 frames (60.2 fps average)

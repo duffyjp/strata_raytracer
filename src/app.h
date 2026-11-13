@@ -93,6 +93,16 @@ struct App {
     GpuBuffer sceneUbo[kFramesInFlight];
     GpuBuffer sbt;
     GpuImage hdr[kFramesInFlight];
+    // The last complete image, kept alive across a quality change so the window never shows a
+    // freshly cleared (blank) target: the next frame is traced into the new one while the screen
+    // still displays this. A small hitch is preferable to a flash.
+    GpuImage hold[kFramesInFlight];
+    bool holdPending[kFramesInFlight] = {};
+    // Two phases, because "installed" and "displayed" are different frames: the present descriptor
+    // still points at the retired image until a frame has actually been recorded that showed it, and
+    // the image must outlive that frame by one more fence. Releasing it a frame early means sampling
+    // a destroyed view, which takes the device down with it.
+    bool holdShown[kFramesInFlight] = {};
     GpuImage whiteTex;
     std::vector<GpuImage> textures;
     VkSampler sampler = VK_NULL_HANDLE;
@@ -128,6 +138,13 @@ struct App {
     int samplesAccumulated = 1;
     bool resizePending = false;
     bool verbose = false;
+    // One-time uploads normally submit and wait. Mid-frame that wait is a full queue drain, which
+    // also waits for the display - long enough for Windows to consider the window unresponsive and
+    // paint it white. While this is set, one-time work is submitted without waiting (a single queue
+    // preserves order) and its command buffers are freed at shutdown.
+    bool deferOneTime = false;
+    std::vector<VkCommandBuffer> retiredCmd;
+    double lastChangeCostMs = 0.0;
 
     // adaptive quality: measure the GPU's own frame time, then spend the budget on samples/pixel
     VkQueryPool timeQueries = VK_NULL_HANDLE;

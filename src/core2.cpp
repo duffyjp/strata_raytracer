@@ -256,7 +256,9 @@ void fillSceneData(App* app, SceneGpuData* d, float t, uint32_t w, uint32_t h, b
                            : 1.f;
     // x = total samples behind the displayed image (the present shader divides by it),
     // y = flipY for the present pass, z = samples this pass adds per pixel.
-    d->camera[6] = V4(float(samplesForDisplay * spp), 1.f, float(spp), ssaa);
+    // x = frames accumulated into the target; the per-pixel sample count is divided out where the
+    // samples are summed, so that the stored image means the same thing at any quality setting.
+    d->camera[6] = V4(float(samplesForDisplay), 1.f, float(spp), ssaa);
     d->camera[7] = V4(app->cfg.skyColor[0], app->cfg.skyColor[1], app->cfg.skyColor[2], 0.f);
 
     for (size_t i = 0; i < app->cfg.materials.size() && i < size_t(kMaxMaterials); ++i) {
@@ -451,6 +453,8 @@ void destroyApp(App* app) {
         destroyBuffer(app, &app->instanceDev[i]);
         destroyBuffer(app, &app->scratch[i]);
         destroyImage(app, &app->hdr[i]);
+        destroyImage(app, &app->hold[i]);
+        app->holdPending[i] = false;
         if (app->tlas[i]) { vkDestroyAccelerationStructureKHR(app->device, app->tlas[i], nullptr); app->tlas[i] = VK_NULL_HANDLE; }
         destroyBuffer(app, &app->tlasBuffer[i]);
         if (app->fence[i]) { vkDestroyFence(app->device, app->fence[i], nullptr); app->fence[i] = VK_NULL_HANDLE; }
@@ -487,6 +491,12 @@ void destroyApp(App* app) {
     if (app->cmdPool) vkDestroyCommandPool(app->device, app->cmdPool, nullptr);
 
     if (app->device) {
+        if (!app->retiredCmd.empty()) {
+            // Command buffers submitted without waiting during a quality change.
+            vkFreeCommandBuffers(app->device, app->cmdPool, uint32_t(app->retiredCmd.size()),
+                                 app->retiredCmd.data());
+            app->retiredCmd.clear();
+        }
         if (app->timeQueries) vkDestroyQueryPool(app->device, app->timeQueries, nullptr);
         app->timeQueries = VK_NULL_HANDLE;
         vkDestroyDevice(app->device, nullptr);

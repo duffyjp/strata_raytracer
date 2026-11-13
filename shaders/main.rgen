@@ -76,5 +76,9 @@ void main() {
     }
 
     vec3 prev = CAM_FRAME.z > 0.5 ? vec3(0.0) : imageLoad(hdrImage, ivec2(pixel)).rgb;
-    imageStore(hdrImage, ivec2(pixel), vec4(prev + max(sum, vec3(0.0)), 1.0));
+    // Store the mean, not the sum: what the image holds must not depend on how many samples went
+    // into it. The present pass divides only by the number of accumulated frames, so a frame kept
+    // from an earlier quality setting still displays at the brightness it was rendered with instead
+    // of being scaled by whatever the sample count happens to be now.
+    imageStore(hdrImage, ivec2(pixel), vec4(prev + max(sum, vec3(0.0)) / float(spp), 1.0));
 }

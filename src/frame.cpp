@@ -315,7 +315,27 @@ static void setLiveScale(App* app, float s) {
     if (fabsf(s - app->liveScale) < 0.02f) return;
     app->liveScale = s;
     drainInFlight(app);
+
+    // Retire the current accumulation targets by moving them aside instead of destroying them. The
+    // frame that follows the change traces into a new target while the screen keeps showing the last
+    // complete image, so adjusting quality cannot present a blank frame.
+    for (int i = 0; i < kFramesInFlight; ++i) {
+        if (app->holdPending[i]) destroyImage(app, &app->hold[i]);
+        app->hold[i] = app->hdr[i];
+        app->holdPending[i] = app->hold[i].image != VK_NULL_HANDLE;
+        app->holdShown[i] = false;
+        memset(&app->hdr[i], 0, sizeof(GpuImage));
+    }
+
+    // No queue drains in here: waiting for the queue also waits for the pending present, and a
+    // window that stops pumping messages gets painted white by Windows.
+    const double t0 = glfwGetTime();
+    app->deferOneTime = true;
+    glfwPollEvents();
     applyHdrSize(app, app->swapExtent.width, app->swapExtent.height);
+    app->deferOneTime = false;
+    glfwPollEvents();
+    app->lastChangeCostMs = (glfwGetTime() - t0) * 1000.0;
     invalidateQuality(app);
     ++app->qualityChanges;
     app->qualityChanged = true;
@@ -427,8 +447,10 @@ void reportGpuFrameTime(App* app, double ms) {
     }
 
     if (app->verbose && (prevSpp != app->liveSpp || prevScale != app->liveScale))
-        logMsg("  quality: %.1f ms measured -> %d spp at scale %.2f (budget %.1f ms of %.1f)\n",
-               app->gpuMsAvg, app->liveSpp, app->liveScale, budget, frameMs);
+        logMsg("  quality: %.1f ms measured -> %d spp at scale %.2f (budget %.1f ms of %.1f, "
+               "change cost %.1f ms)\n",
+               app->gpuMsAvg, app->liveSpp, app->liveScale, budget, frameMs,
+               app->lastChangeCostMs);
 }
 
 static void readAndReportGpuTime(App* app, int slotIdx) {
@@ -693,6 +715,17 @@ int runWindowed(App* app) {
         accPrep += lap();
         VK_CHECK(vkWaitForFences(app->device, 1, &app->fence[app->slot], VK_TRUE, ~0ull));
         VK_CHECK(vkResetFences(app->device, 1, &app->fence[app->slot]));
+        // Release the retired target for this slot only now: its fence just completed, so the frame
+        // that was displaying it has finished sampling it. This runs before the controller, which
+        // may install a fresh one during this same iteration.
+        if (app->holdPending[app->slot] && app->holdShown[app->slot]) {
+            // A frame that displayed the retired image has now completed: free it and let this slot
+            // sample its own live target again.
+            destroyImage(app, &app->hold[app->slot]);
+            app->holdPending[app->slot] = false;
+            app->holdShown[app->slot] = false;
+            writeTraceDescriptors(app, app->slot);
+        }
         readAndReportGpuTime(app, app->slot);  // this slot's previous frame is finished
         accWait += lap();
 
@@ -714,6 +747,9 @@ int runWindowed(App* app) {
 
         buildFrameCommand(app, app->slot, imageIndex, true, instances, app->simTime, reset,
                           app->samplesAccumulated, traceIt);
+        // This frame is the one that displays the retired image for this slot, if there is one; it
+        // may only be freed once its fence has passed.
+        if (app->holdPending[app->slot]) app->holdShown[app->slot] = true;
         accRecord += lap();
 
         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -821,8 +857,9 @@ int runCapture(App* app) {
         readHdrToCpu(app, 0, &hdr);
         char name[256];
         snprintf(name, sizeof(name), "%s\\frame_%03d_t%.2f.png", app->captureDir.c_str(), img, t);
+        // The target holds means per frame, so only the frame count is divided out here.
         writePng(name, app->captureWidth, app->captureHeight, hdr, app->cfg.exposure,
-                 1.0f / float(std::max(1, samples * app->cfg.samplesPerFrame)));
+                 1.0f / float(std::max(1, samples)));
         logMsg("  wrote %s (%d spp)\n", name, samples);
     }
     vkDeviceWaitIdle(app->device);
