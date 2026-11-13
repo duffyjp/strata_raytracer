@@ -1,0 +1,17 @@
+pak: C:\Users\Jacob\Documents\Raytracer\build\bin\scene.pak (4 entries)
+scene.json applied
+adapter 0: NVIDIA RTX PRO 5000 Blackwell            vulkan 1.4  rayTracing=yes rayQuery=yes
+adapter 1: Intel(R) UHD Graphics 770                vulkan 1.3  rayTracing=no rayQuery=no
+rendering on: NVIDIA RTX PRO 5000 Blackwell  [ray-tracing pipeline]
+step: device + queues created
+step: command pool, sync objects, sampler
+  mesh sphere: uploading 1225 verts / 6912 indices
+  mesh cube: uploading 36 verts / 36 indices
+  mesh cone: uploading 576 verts / 576 indices
+  mesh disc: uploading 384 verts / 384 indices
+step: geometry and acceleration structures
+  texture from pak: textures/checker.png (128x128) -> slot 0
+  texture from pak: textures/emissive_ramp.png (64x8) -> slot 1
+step: textures
+step: ray-tracing pipeline ready
+window 1280x720 - drag the border to resize, ESC to quit

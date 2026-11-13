@@ -1,0 +1,79 @@
+// fallback.comp - compute/ray-query path tracer.
+//
+// Used when the selected device exposes VK_KHR_ray_query but not VK_KHR_ray_tracing_pipeline. It
+// walks the very same acceleration structure and calls the very same path-tracing loop as
+// main.rgen, so the picture is identical apart from throughput.
+#version 460 core
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevel;
+layout(set = 0, binding = 1, rgba16f) uniform image2D hdrImage;
+
+// An omitted workgroup size is implementation-defined and comes out as 1x1x1, which silently covers
+// only the fraction of the image the host dispatches groups for. Declare it to match the dispatch.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#include "pt_common.glsl"
+
+bool traceShadingRay(vec3 origin, vec3 direction, float tMax, out HitInfo hit) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, topLevel, gl_RayFlagsOpaqueEXT, ALL_MASK,
+                          origin, 2e-3, direction, tMax);
+    while (rayQueryProceedEXT(rq)) {}
+    if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+        hit.hit = false;
+        return false;
+    }
+    float t = rayQueryGetIntersectionTEXT(rq, true);
+    uint ci = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+    int idx = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+    uint kind = ci >> 8u;
+    vec3 world = rayQueryGetWorldRayOriginEXT(rq) + rayQueryGetWorldRayDirectionEXT(rq) * t;
+
+    hit.hit = true;
+    hit.pos = world;
+    hit.posObj = worldToObjectPoint(idx, world);
+    hit.t = t;
+    hit.material = ci & 0xFFu;
+    hit.kind = kind;
+    hit.normal = objectNormalToWorld(idx, objectNormal(kind, hit.posObj));
+    hit.frontFacing = rayQueryGetIntersectionFrontFaceEXT(rq, true);
+    return true;
+}
+
+bool occludedRay(vec3 origin, vec3 direction, float tMax) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, topLevel,
+                          gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, OCCLUDER_MASK,
+                          origin, 2e-3, direction, tMax);
+    while (rayQueryProceedEXT(rq)) {}
+    return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+}
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    ivec2 res = ivec2(uint(CAM_FRAME.x), uint(CAM_FRAME.y));
+    if (pixel.x >= uint(res.x) || pixel.y >= uint(res.y)) return;
+
+    uint base = uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + uint(CAM_POST.y) * 26699u + 1u;
+    float tanHalf = CAM_ORIGIN_FOV.w;
+
+    int spp = max(1, int(CAM_DISPLAY.z));
+    vec3 sum = vec3(0.0);
+    for (int s = 0; s < spp; ++s) {
+        uint state = base + uint(s) * 7919u;
+        state = pcgHash(state);  // pcgHash mutates its argument, so it needs a real variable
+        vec2 jitter = vec2(rnd(state), rnd(state)) - 0.5;
+        vec2 ndc = ((vec2(pixel) + 0.5 + jitter) / vec2(res)) * 2.0 - 1.0;
+        vec3 dir = normalize(CAM_FWD.xyz
+                             + CAM_RIGHT.xyz * (ndc.x * CAM_RIGHT.w * tanHalf)
+                             + CAM_UP.xyz * (ndc.y * tanHalf));
+        sum += pathTrace(CAM_ORIGIN_FOV.xyz, dir, state);
+    }
+
+    vec3 prev = CAM_FRAME.z > 0.5 ? vec3(0.0) : imageLoad(hdrImage, ivec2(pixel)).rgb;
+    imageStore(hdrImage, ivec2(pixel), vec4(prev + max(sum, vec3(0.0)), 1.0));
+}

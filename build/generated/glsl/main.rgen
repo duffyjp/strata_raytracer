@@ -1,0 +1,484 @@
+// ---- begin main.rgen ----
+// main.rgen - ray generation: one primary ray per pixel, then the shared path-tracing loop.
+//
+// The transport loop lives in pt_common.glsl so the ray-query fallback traces the same paths.
+#version 460 core
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_nonuniform_qualifier : require
+
+// ---- begin payload.glsl ----
+// payload.glsl - the ray payload shared by every stage of the ray-tracing pipeline.
+// The declaration must be byte-identical wherever it is used:
+//   main.rgen        declares it as rayPayloadEXT  (the caller / initialiser)
+//   hit.rchit        declares it as rayPayloadInEXT
+//   miss.rmiss       declares it as rayPayloadInEXT
+// Shadow rays use their own single-word payload at location 1 (see shadow_hit/shadow_miss) so that
+// each ray type only ever touches the payload variable it was traced with.
+struct RayHit {
+    vec4 posT;    // xyz = world hit position, w = t along the ray
+    vec4 posObj;  // xyz = object-space hit position
+    vec4 meta;    // x = materialIndex + 1 (0 = miss), y = primitive kind, z = front facing
+    vec4 normal;  // xyz = world-space geometric normal
+};
+// ---- end payload.glsl ----
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevel;
+layout(set = 0, binding = 1, rgba16f) uniform image2D hdrImage;
+
+layout(location = 0) rayPayloadEXT RayHit rayHit;
+layout(location = 1) rayPayloadEXT uint occludedFlag;
+
+// ---- begin pt_common.glsl ----
+// pt_common.glsl
+//
+// Shared path-tracing core. Textually included (see tools/build_shaders.py) into:
+//   shaders/main.rgen      - ray-generation shader of the VK_KHR_ray_tracing_pipeline path
+//   shaders/fallback.comp  - compute shader using VK_KHR_ray_query on the same acceleration
+//                            structure, for hardware that exposes ray queries but no RT pipeline
+//
+// The includer declares its payload variables, includes this file, then implements the two backend
+// hooks below and its own main().
+
+// ---- begin sceneblock.glsl ----
+// sceneblock.glsl - the host <-> GPU contract. Mirrored byte-for-byte by SceneGpuData in
+// src/scene.h. std140 with vec4-only members means the C++ and GLSL layouts cannot drift.
+
+struct Material {
+    vec4 albedo;    // rgb, w = diffuse amount (unused for metal/glass)
+    vec4 emissive;  // rgb * strength
+    vec4 params;    // x = reflectivity, y = roughness, z = ior, w = texture scale
+    vec4 flags;     // x = model (0 lambert, 1 metal, 2 glass, 3 emissive), y = texture slot or -1
+};
+
+struct Light {
+    vec4 posRadius;  // xyz = centre, w = radius
+    vec4 color;      // rgb * intensity, w = on/off
+};
+
+layout(set = 0, binding = 2, std140) uniform SceneBlock {
+    vec4 camera[8];
+    Material materials[32];
+    Light lights[4];
+} scene;
+
+#define LIGHT_COUNT 4
+
+// camera[] contract (see GpuCamera in src/scene.h)
+#define CAM_ORIGIN_FOV scene.camera[0]   // xyz origin, w = tan(fovY/2)
+#define CAM_RIGHT      scene.camera[1]   // xyz right, w = aspect
+#define CAM_UP         scene.camera[2]   // xyz up
+#define CAM_FWD        scene.camera[3]   // xyz forward, w = max bounces
+#define CAM_FRAME      scene.camera[4]   // x = width, y = height, z = reset accumulation, w = time
+#define CAM_POST       scene.camera[5]   // x = exposure, y = frame index, z = radiance clamp, w = sky mode
+#define CAM_DISPLAY    scene.camera[6]   // x = samples accumulated for display, y = flipY
+#define CAM_SKY        scene.camera[7]   // xyz horizon colour
+
+// Cull-mask channels for VkAccelerationStructureInstanceKHR.mask.
+#define OCCLUDER_MASK  1u
+#define LIGHT_MASK     2u
+#define ALL_MASK       255u
+
+// Primitive kinds, packed into instanceCustomIndex as (kind << 8) | materialIndex.
+#define KIND_SPHERE 0u
+#define KIND_CUBE   1u
+#define KIND_CONE   2u
+#define KIND_DISC   3u
+// ---- end sceneblock.glsl ----
+// ---- begin instances.glsl ----
+// instances.glsl - per-instance transforms supplied by the host.
+//
+// The built-in ray-tracing matrices (gl_ObjectToWorldEXT / gl_WorldToObject3x4EXT) have awkward
+// GLSL typing (a mat3x4 cannot be multiplied by a vec4), so the host uploads both matrices per TLAS
+// instance instead. That keeps the point/normal transforms unambiguous and portable, and lets the
+// CPU precompute the world-to-object matrix used for normal mapping.
+//
+// std430 + mat4 members: 64 bytes per matrix, 128 bytes per instance, matching GpuInstance in
+// src/scene.h.
+struct InstanceXform {
+    mat4 objectToWorld;
+    mat4 worldToObject;
+};
+
+layout(set = 0, binding = 5, std430) buffer InstanceBlock {
+    InstanceXform instances[];
+} instanceData;
+
+// World-space point -> object space.
+vec3 worldToObjectPoint(int idx, vec3 p) {
+    return (instanceData.instances[idx].worldToObject * vec4(p, 1.0)).xyz;
+}
+
+// Object-space normal -> world space. Transposing the world-to-object linear part is the correct
+// normal transform and stays exact under non-uniform instance scaling.
+vec3 objectNormalToWorld(int idx, vec3 nObj) {
+    mat4 B = instanceData.instances[idx].worldToObject;
+    vec3 n = vec3(dot(B[0].xyz, nObj), dot(B[1].xyz, nObj), dot(B[2].xyz, nObj));
+    float l = length(n);
+    return l > 1e-8 ? n / l : nObj;
+}
+// ---- end instances.glsl ----
+// ---- begin primitives.glsl ----
+// primitives.glsl - analytic per-primitive geometry helpers, shared by the closest-hit shaders and
+// the path tracer. All primitives are authored at unit size and scaled by the instance transform:
+//   KIND_SPHERE : radius 1 at the origin
+//   KIND_CUBE   : half-extent 0.5 at the origin
+//   KIND_CONE   : base radius 1 in the y=0 plane, apex at y=1
+//   KIND_DISC   : radius 1 in the y=0 plane, facing +y
+// Normals and UVs are derived from the object-space hit position, so the meshes need no UV channel
+// and the shading is exact rather than interpolated.
+
+vec3 objectNormal(uint kind, vec3 p) {
+    if (kind == KIND_SPHERE) {
+        return normalize(p + vec3(1e-9));
+    } else if (kind == KIND_CUBE) {
+        vec3 a = abs(p);
+        vec3 axis = (a.x >= a.y && a.x >= a.z) ? vec3(1.0, 0.0, 0.0)
+                    : ((a.y >= a.z) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0));
+        return axis * sign(dot(axis, p) + 1e-9);
+    } else if (kind == KIND_CONE) {
+        float y = clamp(p.y, 0.0, 1.0);
+        float rr = length(p.xz);
+        if (y < 0.02 && rr > 0.02) return vec3(0.0, -1.0, 0.0);   // base disc
+        vec3 g = vec3(2.0 * p.x, 2.0 * (1.0 - y), 2.0 * p.z);     // grad of x^2+z^2-(1-y)^2
+        if (length(g.xz) < 1e-6) return vec3(0.0, 1.0, 0.0);      // apex
+        return normalize(g);
+    }
+    return vec3(0.0, 1.0, 0.0);                                   // disc
+}
+
+// Object-space normal -> world space. The transpose of the world-to-object linear part is the
+// correct normal transform and stays exact under non-uniform instance scaling.
+vec3 objectNormalToWorldMat(mat4 worldToObject, vec3 nObj) {
+    vec3 n = vec3(dot(worldToObject[0].xyz, nObj),
+                  dot(worldToObject[1].xyz, nObj),
+                  dot(worldToObject[2].xyz, nObj));
+    float l = length(n);
+    return l > 1e-8 ? n / l : nObj;
+}
+
+vec2 objectUV(uint kind, vec3 p) {
+    if (kind == KIND_DISC || kind == KIND_CUBE) return vec2(p.x, p.z);
+    return vec2(atan(p.z, p.x) / (2.0 * 3.14159265358979323846) + 0.5, p.y);
+}
+// ---- end primitives.glsl ----
+// ---- begin sky.glsl ----
+// sky.glsl - analytic environment. Requires sceneblock.glsl to be included first.
+vec3 skyColor(vec3 d) {
+    float up = clamp(d.y, -1.0, 1.0);
+    vec3 horizon = CAM_SKY.xyz;
+    vec3 zenith = mix(horizon, vec3(0.13, 0.24, 0.45), 0.92);
+    vec3 c = mix(horizon * 0.55, zenith, smoothstep(0.0, 0.55, up));
+    c = mix(c, horizon * 0.10, smoothstep(0.0, -0.35, up));
+    vec3 lp = scene.lights[0].posRadius.xyz;
+    float glow = pow(clamp(dot(d, normalize(lp)), 0.0, 1.0), 28.0);
+    c += scene.lights[0].color.rgb * 0.03 * glow;
+    return c;
+}
+// ---- end sky.glsl ----
+
+struct HitInfo {
+    vec3 pos;         // world space
+    vec3 posObj;      // object space (analytic normals + UVs)
+    vec3 normal;      // world space, geometric
+    float t;
+    uint material;
+    uint kind;
+    bool hit;
+    bool frontFacing;
+};
+
+// Backend hooks implemented by the includer (declared after HitInfo, which they reference).
+bool traceShadingRay(vec3 origin, vec3 direction, float tMax, out HitInfo hit);
+bool occludedRay(vec3 origin, vec3 direction, float tMax);
+
+// ---------- maths / rng -------------------------------------------------------------------------
+const float PI = 3.14159265358979323846;
+
+uint pcgHash(inout uint state) {
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float rnd(inout uint state) { return float(pcgHash(state)) * (1.0 / 4294967296.0); }
+vec2 rnd2(inout uint state) { return vec2(rnd(state), rnd(state)); }
+
+vec3 tangentFrameT(vec3 n) {
+    vec3 up = abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    return normalize(cross(up, n));
+}
+
+vec3 cosineHemisphere(vec3 n, vec2 u) {
+    float phi = 2.0 * PI * u.x;
+    float sinTheta = sqrt(max(0.0, u.x));
+    float cosTheta = sqrt(max(0.0, 1.0 - u.x));
+    vec3 t = tangentFrameT(n);
+    vec3 b = cross(n, t);
+    return normalize(t * (cos(phi) * sinTheta) + b * (sin(phi) * sinTheta) + n * cosTheta);
+}
+
+float fresnelSchlick(float cosTheta, float f0) {
+    float m = clamp(cosTheta, 0.0, 1.0);
+    return f0 + (1.0 - f0) * pow(1.0 - m, 5.0);
+}
+
+vec3 fresnelSchlick3(float cosTheta, vec3 f0) {
+    float m = clamp(cosTheta, 0.0, 1.0);
+    return f0 + (vec3(1.0) - f0) * pow(1.0 - m, 5.0);
+}
+
+float fresnelDielectric(float cosI, float ior) {
+    float f0c = (1.0 - ior) / (1.0 + ior);
+    return fresnelSchlick(abs(cosI), f0c * f0c);
+}
+
+float smithG1(float ncos, float a2) {
+    float n = max(1e-5, abs(ncos));
+    return 2.0 / (1.0 + sqrt(max(1e-8, 1.0 + a2 * (1.0 - n * n) / (n * n))));
+}
+
+// Importance samples the GGX NDF by half-vector; the NDF cancels against the pdf so the returned
+// weight is just the geometry term times the Jacobian. Caller multiplies by Fresnel and albedo.
+//
+// The separable Smith term makes the weight blow up at grazing view angles, which is where glossy
+// surfaces otherwise throw bright speckles, so it is clamped: a small, standard, deliberate bias.
+bool sampleSpecular(vec3 wo, vec3 n, float roughness, vec2 u, out vec3 wi, out float weight) {
+    wi = wo;
+    weight = 0.0;
+    float a = max(0.004, roughness * roughness);
+    float a2 = a * a;
+    float phi = 2.0 * PI * u.x;
+    float cosThetaH = sqrt(max(1e-6, (1.0 - u.y) / (1.0 + (a2 - 1.0) * u.y)));
+    float sinThetaH = sqrt(max(0.0, 1.0 - cosThetaH * cosThetaH));
+    vec3 t = tangentFrameT(n);
+    vec3 b = cross(n, t);
+    mat3 TBN = mat3(t, b, n);
+    vec3 h = normalize(TBN * vec3(sinThetaH * cos(phi), sinThetaH * sin(phi), cosThetaH));
+    vec3 cand = reflect(-wo, h);
+    float noL = dot(n, cand);
+    float voH = dot(wo, h);
+    float noV = max(1e-4, dot(n, wo));
+    if (noL <= 0.0 || voH <= 0.0) return false;
+    weight = min(3.0, smithG1(noV, a2) * smithG1(noL, a2) * voH / (noV * max(1e-4, cosThetaH)));
+    wi = normalize(cand);
+    return true;
+}
+
+// ---------- textures supplied by the .pak -------------------------------------------------------
+layout(set = 0, binding = 3) uniform texture2D sceneTextures[8];
+layout(set = 0, binding = 4) uniform sampler sceneSampler;
+
+vec3 sampleTexture(int slot, vec2 uv) {
+    if (slot < 0 || slot > 7) return vec3(1.0);
+    return textureLod(sampler2D(nonuniformEXT(sceneTextures[slot]), sceneSampler), fract(uv), 0.0).rgb;
+}
+
+vec3 proceduralChecker(vec2 uv, float scale) {
+    vec2 g = floor(uv * max(0.01, scale));
+    float c = mod(g.x + g.y, 2.0);
+    return mix(vec3(0.60, 0.61, 0.65), vec3(0.23, 0.24, 0.28), c);
+}
+
+// ---------- direct lighting (next-event estimation over the packed light list) ------------------
+vec3 directLighting(HitInfo h, Material m, vec3 wo, vec3 albedo, inout uint state) {
+    vec3 accum = vec3(0.0);
+    float model = m.flags.x;
+    if (model > 1.5) return accum;   // glass is handled purely specularly in the transport loop
+
+    for (int i = 0; i < LIGHT_COUNT; ++i) {
+        Light L = scene.lights[i];
+        if (L.color.w <= 0.0) continue;
+        vec3 cToL = L.posRadius.xyz - h.pos;
+        float distC = length(cToL);
+        vec3 dirC = cToL / max(1e-5, distC);
+        if (dot(h.normal, dirC) <= 0.0) continue;
+
+        // Sample a point on the light's disc so shadows get a soft penumbra.
+        float rL = max(1e-3, L.posRadius.w);
+        vec3 lt = tangentFrameT(dirC);
+        vec3 lb = cross(dirC, lt);
+        vec2 u = rnd2(state);
+        float rr = rL * 0.9 * sqrt(u.x);
+        float ang = 2.0 * PI * u.y;
+        vec3 lp = L.posRadius.xyz + lt * (cos(ang) * rr) + lb * (sin(ang) * rr);
+        vec3 sd = lp - h.pos;
+        float sdLen = length(sd);
+        vec3 sdir = sd / max(1e-5, sdLen);
+        vec3 toCentre = L.posRadius.xyz - lp;
+        float cosLC = max(0.0, dot(-sdir, toCentre / max(1e-5, length(toCentre))));
+        float ndots = max(0.0, dot(h.normal, sdir));
+        if (ndots <= 1e-5 || cosLC <= 1e-4) continue;
+
+        if (occludedRay(h.pos + h.normal * 0.0015, sdir, sdLen - 0.004)) continue;
+
+        float pdf = sdLen * sdLen / max(1e-4, PI * rL * rL * 0.81 * cosLC * ndots);
+        float falloff = 1.0 / (1.0 + 0.015 * sdLen * sdLen);
+        vec3 incoming = L.color.rgb * (falloff / max(1e-4, pdf));
+
+        if (model < 0.5) {
+            accum += albedo * incoming * (1.0 / PI);
+        } else {
+            vec3 hv = normalize(wo + sdir);
+            float a = max(0.002, m.params.y * m.params.y);
+            float a2 = a * a;
+            float noh = max(0.0, dot(h.normal, hv));
+            float gh = 1.0 + (a2 - 1.0) * noh * noh;
+            float d = a2 / max(1e-8, PI * gh * gh);
+            float fres = fresnelSchlick(max(1e-4, dot(wo, hv)), clamp(m.params.x, 0.04, 1.0));
+            float g = smithG1(dot(h.normal, wo), a2) * smithG1(dot(h.normal, sdir), a2);
+            float noV = max(1e-4, dot(h.normal, wo));
+            accum += albedo * incoming * (d * fres * g / (4.0 * noV));
+        }
+    }
+    return accum;
+}
+
+// ---------- the shared transport loop ------------------------------------------------------------
+vec3 pathTrace(vec3 origin, vec3 direction, uint state) {
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+    int maxBounces = int(CAM_FWD.w);
+    float clampV = CAM_POST.z;
+
+    for (int bounce = 0; bounce < maxBounces; ++bounce) {
+        HitInfo h;
+        if (!traceShadingRay(origin, direction, 1e5, h)) {
+            radiance += throughput * skyColor(direction);
+            break;
+        }
+
+        Material m = scene.materials[h.material];
+        radiance += throughput * m.emissive.rgb;
+        float model = m.flags.x;
+        if (model > 2.5) break;   // emitter: its shading contribution is the emissive term
+
+        vec3 wo = -normalize(direction);
+        float rough = clamp(m.params.y, 0.0, 1.0);
+        float refl = clamp(m.params.x, 0.0, 1.0);
+        float ior = m.params.z > 1.0001 ? m.params.z : 1.5;
+
+        vec3 albedo = m.albedo.rgb;
+        if (m.flags.y >= 0.0) {
+            vec2 uv = objectUV(h.kind, h.posObj) * (m.params.w > 0.0 ? m.params.w : 1.0);
+            vec3 tex = sampleTexture(int(m.flags.y), uv);
+            if (max(max(tex.r, tex.g), tex.b) <= 1e-4) tex = proceduralChecker(uv, m.params.w);
+            albedo *= mix(vec3(1.0), tex, 0.85);
+        }
+
+        radiance += clamp(throughput * directLighting(h, m, wo, albedo, state), vec3(0.0), vec3(clampV));
+
+        vec3 nextDir = direction;
+        vec3 attenuate = vec3(0.0);
+        if (model < 0.5) {
+            // Rough dielectric: mostly Lambertian with a glossy lobe driven by reflectivity.
+            float wgt;
+            if (refl > 0.02 && rnd(state) < clamp(refl, 0.0, 0.9) &&
+                sampleSpecular(wo, h.normal, max(0.03, rough), rnd2(state), nextDir, wgt)) {
+                attenuate = albedo * wgt * fresnelSchlick(dot(wo, nextDir), 0.04);
+            } else {
+                nextDir = cosineHemisphere(h.normal, rnd2(state));
+                attenuate = albedo;
+            }
+        } else if (model < 1.5) {
+            // Metal: tinted Fresnel + GGX, reflectivity scales the retained energy.
+            float wgt;
+            if (!sampleSpecular(wo, h.normal, max(0.004, rough), rnd2(state), nextDir, wgt)) break;
+            attenuate = fresnelSchlick3(dot(wo, nextDir), albedo) * wgt * max(0.05, refl);
+        } else {
+            // Glass: Fresnel-weighted reflection or refraction, with total internal reflection.
+            float f = fresnelDielectric(dot(wo, h.normal), ior);
+            if (rnd(state) < f) {
+                nextDir = reflect(-wo, h.normal);
+                attenuate = vec3(f);
+            } else {
+                vec3 n = h.normal;
+                float eta = ior;
+                if (!h.frontFacing) { n = -h.normal; eta = 1.0 / ior; }
+                vec3 refr = refract(-wo, n, 1.0 / eta);
+                if (dot(refr, refr) < 1e-8) {
+                    nextDir = reflect(-wo, n);
+                    attenuate = vec3(1.0);
+                } else {
+                    nextDir = normalize(refr);
+                    attenuate = vec3(1.0) - vec3(f);
+                }
+            }
+            attenuate *= mix(vec3(1.0), m.albedo.rgb, 0.2);   // faint tint through the volume
+        }
+
+        throughput *= attenuate;
+        float lum = max(throughput.r, max(throughput.g, throughput.b));
+        if (lum < 0.005) break;
+        if (lum > 1.0) throughput /= lum;   // bounded energy; hue is preserved
+
+        origin = h.pos + nextDir * 0.0015;
+        direction = normalize(nextDir);
+    }
+    return radiance;
+}
+// ---- end pt_common.glsl ----
+
+// SBT layout (see src/main.cpp): hit region record 0 = hit.rchit, record 1 = shadow_hit.rchit;
+// miss region record 0 = miss.rmiss, record 1 = shadow_miss.rmiss.
+#define HIT_GROUP_SHADE   0u
+#define HIT_GROUP_SHADOW  1u
+#define MISS_GROUP_SCENE  0u
+#define MISS_GROUP_SHADOW 1u
+
+bool traceShadingRay(vec3 origin, vec3 direction, float tMax, out HitInfo hit) {
+    rayHit.meta = vec4(0.0);   // meta.x == 0 means "nothing hit"
+    traceRayEXT(topLevel, gl_RayFlagsOpaqueEXT, ALL_MASK,
+                HIT_GROUP_SHADE, 0u, MISS_GROUP_SCENE,
+                origin, 2e-3, direction, tMax, 0);
+    if (rayHit.meta.x <= 0.0) {
+        hit.hit = false;
+        return false;
+    }
+    hit.hit = true;
+    hit.pos = rayHit.posT.xyz;
+    hit.t = rayHit.posT.w;
+    hit.posObj = rayHit.posObj.xyz;
+    hit.normal = normalize(rayHit.normal.xyz);
+    hit.material = uint(rayHit.meta.x) - 1u;
+    hit.kind = uint(rayHit.meta.y);
+    hit.frontFacing = rayHit.meta.z > 0.5;
+    return true;
+}
+
+bool occludedRay(vec3 origin, vec3 direction, float tMax) {
+    occludedFlag = 0u;
+    traceRayEXT(topLevel,
+                gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, OCCLUDER_MASK,
+                HIT_GROUP_SHADOW, 0u, MISS_GROUP_SHADOW,
+                origin, 2e-3, direction, tMax, 1);
+    return occludedFlag != 0u;
+}
+
+void main() {
+    uvec2 pixel = gl_LaunchIDEXT.xy;
+    ivec2 res = ivec2(uint(CAM_FRAME.x), uint(CAM_FRAME.y));
+    if (pixel.x >= uint(res.x) || pixel.y >= uint(res.y)) return;
+
+    uint base = uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + uint(CAM_POST.y) * 26699u + 1u;
+    float tanHalf = CAM_ORIGIN_FOV.w;
+
+    // CAM_DISPLAY.z samples per pixel per dispatched frame: more samples cost linearly but steady
+    // the 1-sample-per-frame image that a moving camera otherwise shows.
+    int spp = max(1, int(CAM_DISPLAY.z));
+    vec3 sum = vec3(0.0);
+    for (int s = 0; s < spp; ++s) {
+        uint state = base + uint(s) * 7919u;
+        state = pcgHash(state);  // pcgHash mutates its argument, so it needs a real variable
+        vec2 jitter = vec2(rnd(state), rnd(state)) - 0.5;
+        vec2 ndc = ((vec2(pixel) + 0.5 + jitter) / vec2(res)) * 2.0 - 1.0;
+        vec3 dir = normalize(CAM_FWD.xyz
+                             + CAM_RIGHT.xyz * (ndc.x * CAM_RIGHT.w * tanHalf)
+                             + CAM_UP.xyz * (ndc.y * tanHalf));
+        sum += pathTrace(CAM_ORIGIN_FOV.xyz, dir, state);
+    }
+
+    vec3 prev = CAM_FRAME.z > 0.5 ? vec3(0.0) : imageLoad(hdrImage, ivec2(pixel)).rgb;
+    imageStore(hdrImage, ivec2(pixel), vec4(prev + max(sum, vec3(0.0)), 1.0));
+}
+// ---- end main.rgen ----

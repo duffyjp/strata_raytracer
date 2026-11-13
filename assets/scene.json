@@ -1,0 +1,186 @@
+{
+  "comment": "Scene description. Edit, repack with tools/make_pak.py, restart the app.",
+  "exposure": 1.7,
+  "maxBounces": 6,
+  "accumulationFrames": 1,
+  "radianceClamp": 12.0,
+  "skyColor": [
+    0.4,
+    0.45,
+    0.54
+  ],
+  "camera": {
+    "orbitRadius": 9.5,
+    "orbitHeight": 3.2,
+    "heightBob": 0.6,
+    "speed": 0.24,
+    "fovDeg": 42.0,
+    "lookAt": [
+      0.0,
+      0.85,
+      0.0
+    ]
+  },
+  "materials": [
+    {
+      "name": "ground",
+      "model": 0,
+      "albedo": [
+        0.52,
+        0.53,
+        0.56
+      ],
+      "reflectivity": 0.12,
+      "roughness": 0.35,
+      "ior": 1.4,
+      "texture": "checker",
+      "textureScale": 1.0
+    },
+    {
+      "name": "mirror",
+      "model": 1,
+      "albedo": [
+        0.95,
+        0.96,
+        0.97
+      ],
+      "reflectivity": 0.95,
+      "roughness": 0.02
+    },
+    {
+      "name": "satin",
+      "model": 1,
+      "albedo": [
+        0.86,
+        0.87,
+        0.9
+      ],
+      "reflectivity": 0.7,
+      "roughness": 0.16
+    },
+    {
+      "name": "red_dull",
+      "model": 0,
+      "albedo": [
+        0.82,
+        0.2,
+        0.16
+      ],
+      "reflectivity": 0.05,
+      "roughness": 0.6
+    },
+    {
+      "name": "glass",
+      "model": 2,
+      "albedo": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "reflectivity": 0.05,
+      "roughness": 0.01,
+      "ior": 1.52
+    },
+    {
+      "name": "mirror_cube",
+      "model": 1,
+      "albedo": [
+        0.9,
+        0.92,
+        0.95
+      ],
+      "reflectivity": 0.85,
+      "roughness": 0.05
+    },
+    {
+      "name": "teal",
+      "model": 0,
+      "albedo": [
+        0.18,
+        0.55,
+        0.47
+      ],
+      "reflectivity": 0.06,
+      "roughness": 0.55
+    },
+    {
+      "name": "light_warm",
+      "model": 3,
+      "albedo": [
+        0.1,
+        0.08,
+        0.06
+      ],
+      "emissive": [
+        13.0,
+        8.6,
+        4.8
+      ]
+    },
+    {
+      "name": "light_cool",
+      "model": 3,
+      "albedo": [
+        0.06,
+        0.08,
+        0.1
+      ],
+      "emissive": [
+        5.2,
+        8.4,
+        13.0
+      ]
+    }
+  ],
+  "lights": [
+    {
+      "name": "key",
+      "color": [
+        1.0,
+        0.78,
+        0.55
+      ],
+      "intensity": 16.0,
+      "radius": 0.34,
+      "orbitRadius": 3.9,
+      "orbitHeight": 2.6,
+      "speed": 0.55,
+      "phase": 0.0
+    },
+    {
+      "name": "fill",
+      "color": [
+        0.45,
+        0.66,
+        1.0
+      ],
+      "intensity": 10.0,
+      "radius": 0.27,
+      "orbitRadius": 4.7,
+      "orbitHeight": 1.7,
+      "speed": -0.4,
+      "phase": 2.1
+    }
+  ],
+  "textures": [
+    {
+      "name": "checker",
+      "file": "textures/checker.png",
+      "scale": 6.0
+    },
+    {
+      "name": "ramp",
+      "file": "textures/emissive_ramp.png",
+      "scale": 1.0
+    }
+  ],
+  "samplesPerFrame": 1,
+  "autoQuality": true,
+  "targetFps": 60.0,
+  "qualityHeadroom": 0.26,
+  "maxSamplesPerFrame": 16,
+  "minRenderScale": 0.4,
+  "baseSamplesPerFrame": 4,
+  "maxRenderScale": 2.0,
+  "maxTracePixels": 8500000
+}
