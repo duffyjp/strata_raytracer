@@ -152,6 +152,17 @@ struct App {
     double gpuMsAvg = 0.0;          // smoothed full-frame GPU time at the current settings
     double cpuMsAvg = 0.0;          // smoothed real interval between frames: did we make vsync?
     int cleanPaceStreak = 0;        // consecutive frames that met the deadline
+    uint32_t lateFramesWindow = 0;  // frames since the last quality change that missed vsync
+    uint32_t framesWindow = 0;      // ...out of how many
+    // Histogram of frame intervals (1 ms bins) since the last quality change. The refresh period is
+    // the *most common* interval, not the shortest: a loop that sometimes runs twice per vsync makes
+    // the minimum useless, and the average hides the very thing being looked for - frames that
+    // arrive a whole vsync late. Both the period and the late fraction are read from this.
+    uint32_t dtBins[72] = {};
+    // The display's own cadence, learned from the shortest intervals observed. Asking for 120 fps on
+    // a 60 Hz panel must not read as "every frame is late", and a 16.7 ms average can hide half the
+    // frames arriving at 33 ms; measuring against the real refresh period handles both.
+    double paceFloorMs = 0.0;
     int overStreak = 0;             // consecutive decision windows over budget
     int underStreak = 0;            // ...and comfortably under it
     double msPerSampleKiloPx = 0.0;  // smoothed unit cost, used to predict the next choice

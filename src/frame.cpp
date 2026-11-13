@@ -192,7 +192,18 @@ bool createSwapchain(App* app, uint32_t width, uint32_t height) {
                           ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
                           : caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    // FIFO is vsync: the loop waits for the display, which is what makes motion even. When asked to
+    // run without it, mailbox is preferred over immediate because it still never tears.
     ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    if (!app->cfg.vsync) {
+        uint32_t pmN = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(app->physicalDevice, app->surface, &pmN, nullptr);
+        std::vector<VkPresentModeKHR> pms(pmN);
+        vkGetPhysicalDeviceSurfacePresentModesKHR(app->physicalDevice, app->surface, &pmN,
+                                                  pms.data());
+        for (VkPresentModeKHR m : {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR})
+            if (std::find(pms.begin(), pms.end(), m) != pms.end()) { ci.presentMode = m; break; }
+    }
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = VK_NULL_HANDLE;
 
@@ -273,6 +284,31 @@ static const int kStaleFramesAfterChange = 3;  // measurements still reflecting 
 static const int kAdjustEveryFrames = 12;      // re-decide about five times a second
 static const double kDeadband = 0.72;          // between 72% and 104% of budget, change nothing
 
+// What the display will actually deliver. Sizing the frame budget for 60 Hz when the panel runs at
+// 58 or 59 makes it slightly too big on every single frame: the number in the title bar still looks
+// fine, but the delivery is consistently on the edge, and that is felt as roughness.
+static double effectiveFps(const SceneConfig& c)
+{
+    double want = double(c.targetFps);
+    if (c.detectedRefresh >= 20.0 && c.detectedRefresh <= 400.0) want = std::min(want, double(c.detectedRefresh));
+    return want > 0.0 ? want : 60.0;
+}
+
+// One knob for "this machine cannot hold the frame": the bundles only move the ceiling and how much
+// of each frame is left spare, so samples and supersampling keep adapting inside a smaller box.
+static void applyQualityMode(SceneConfig& c)
+{
+    if (c.qualityMode == "balanced") {
+        c.qualityHeadroom = 0.34f; c.maxRenderScale = 1.25f;
+        c.baseSamplesPerFrame = 2; c.maxSamplesPerFrame = 8;
+    } else if (c.qualityMode == "performance") {
+        c.qualityHeadroom = 0.40f; c.maxRenderScale = 1.0f; c.minRenderScale = 0.5f;
+        c.baseSamplesPerFrame = 1; c.maxSamplesPerFrame = 4;
+    } else if (c.qualityMode == "off") {
+        c.autoQuality = false;
+    }
+}
+
 void createTimingQueries(App* app) {
     if (app->props.limits.timestampPeriod <= 0.f) {
         logMsg("  timing: this device reports no timestamp period; quality stays fixed\n");
@@ -298,6 +334,9 @@ void invalidateQuality(App* app) {
     app->settleFrames = 0;
     app->overStreak = 0;
     app->underStreak = 0;
+    app->lateFramesWindow = 0;
+    app->framesWindow = 0;
+    memset(app->dtBins, 0, sizeof(app->dtBins));
     app->qualityChanged = true;
 }
 
@@ -327,13 +366,9 @@ static void setLiveScale(App* app, float s) {
         memset(&app->hdr[i], 0, sizeof(GpuImage));
     }
 
-    // No queue drains in here: waiting for the queue also waits for the pending present, and a
-    // window that stops pumping messages gets painted white by Windows.
     const double t0 = glfwGetTime();
-    app->deferOneTime = true;
     glfwPollEvents();
     applyHdrSize(app, app->swapExtent.width, app->swapExtent.height);
-    app->deferOneTime = false;
     glfwPollEvents();
     app->lastChangeCostMs = (glfwGetTime() - t0) * 1000.0;
     invalidateQuality(app);
@@ -349,8 +384,30 @@ void reportGpuFrameTime(App* app, double ms) {
     app->gpuMsAvg = (app->gpuMsAvg <= 0.0) ? ms : (a * ms + (1.0 - a) * app->gpuMsAvg);
     if (++app->settleFrames < kAdjustEveryFrames) return;
 
-    const double frameMs = 1000.0 / double(app->cfg.targetFps);
-    const double budget = frameMs * (1.0 - double(app->cfg.qualityHeadroom));
+    const double frameMs = 1000.0 / effectiveFps(app->cfg);
+    // Read the display's cadence and the lateness from one histogram: the refresh period is the
+    // interval that occurs most often (smoothed over neighbouring milliseconds, since 16 and 17 ms
+    // are the same period), and a frame counts as late once it is past a third of a period beyond
+    // that. Frames arriving a whole vsync late are what the eye reads as stutter, and they are
+    // entirely invisible in an average frame rate.
+    uint32_t histTotal = 0, modeCount = 0, modeMs = 0;
+    for (uint32_t i = 2; i < 72; ++i) {
+        histTotal += app->dtBins[i];
+        const uint32_t pair = app->dtBins[i] + (i + 1 < 72 ? app->dtBins[i + 1] : 0);
+        if (pair > modeCount) { modeCount = pair; modeMs = i; }
+    }
+    // The budget is the requested frame period, never a measured one: the histogram is cleared at
+    // each change, so for its first frames the mode can be a short interval, which collapses the
+    // budget, cuts the sample count, then recovers and climbs again - a self-sustaining cycle at
+    // about the decision rate. The mode is therefore kept only as a diagnostic.
+    const double periodMs = frameMs;
+    (void)modeMs;
+    uint32_t lateCount = 0;
+    const uint32_t lateAbove = uint32_t(periodMs * 1.35);
+    if (modeCount >= 10)
+        for (uint32_t i = lateAbove; i < 72; ++i) lateCount += app->dtBins[i];
+    const double lateFrac = histTotal >= 30 ? double(lateCount) / double(histTotal) : 0.0;
+    const double budget = periodMs * (1.0 - double(app->cfg.qualityHeadroom));
     // Watchdog. The command buffer can report that it fits while the display still misses vsync, so
     // the real interval gets a vote too: aim lower until the pace recovers, and refuse to climb
     // again until the pace has been clean for three quarters of a second - otherwise the two
@@ -358,8 +415,12 @@ void reportGpuFrameTime(App* app, double ms) {
     // Blame the workload only when the GPU is also near its budget. Missing a 120 fps target on a
     // 60 Hz panel is the display talking, and cutting quality for that would just give a worse
     // picture at the same frame rate.
+    // Measured between the CPU loop's own iterations, "lateness" is not what the display shows: with
+    // the workload well under the refresh period the loop alternates short and long intervals while
+    // presents still land on vsync boundaries. So the histogram informs the target period, but does
+    // not drive quality decisions - the average frame time and the GPU's own measurement do.
     const bool nearBudget = app->gpuMsAvg > kDeadband * budget;
-    const bool missingVsync = app->cpuMsAvg > frameMs * 1.10 && nearBudget;
+    const bool missingVsync = app->cpuMsAvg > periodMs * 1.10 && nearBudget;
     if (missingVsync) app->cleanPaceStreak = 0; else ++app->cleanPaceStreak;
     const double budgetUse = missingVsync ? budget * 0.85 : budget;
     // Kilopixels the trace target would cover at scale 1.0 for this window.
@@ -422,9 +483,16 @@ void reportGpuFrameTime(App* app, double ms) {
     // one being considered is worth it. Over budget, dropping is mandatory however small the step;
     // under budget, climb only on a difference of two samples or more. That asymmetry is what stops
     // the controller from flapping by one sample on either side of the line.
+    // Hysteresis on delivery: cut above 6% late, climb only below 3%. A desktop run of about 2% late
+    // is ordinary system noise and must not be mistaken for the workload being too heavy, otherwise
+    // the controller refuses to spend anything at all.
     const bool settledPace = !missingVsync && app->cleanPaceStreak >= 45;
+    // A scale change is the expensive one - it reallocates the trace target and replays a frame - so
+    // it has to be worth it: a fifth of the current scale, not a nudge. Sample count, which costs
+    // nothing, still moves in steps of two. A resize is unaffected because it discards the model and
+    // the difference it produces is far larger than this.
     const bool scaleDiffers = fabs(double(wantScale) - double(app->liveScale)) >
-                              0.06 * double(app->liveScale);
+                              0.2 * double(app->liveScale);
     const bool scaleMove = scaleDiffers && ((wantScale < app->liveScale && mayReduce) ||
                                             (wantScale > app->liveScale && mayClimb && settledPace));
     const bool sppMove = mayReduce
@@ -641,11 +709,19 @@ int runWindowed(App* app) {
     app->liveScale = app->renderScale;
     app->userScaleCap = app->renderScale;
     app->liveSpp = std::max(1, app->cfg.samplesPerFrame);
+    applyQualityMode(app->cfg);
+    GLFWmonitor* mon = glfwGetPrimaryMonitor();
+    const GLFWvidmode* vm = mon ? glfwGetVideoMode(mon) : nullptr;
+    if (vm && vm->refreshRate > 0) app->cfg.detectedRefresh = float(vm->refreshRate);
+    logMsg("display: %d Hz panel, targeting %.0f fps, vsync %s, quality mode %s\n",
+           vm ? vm->refreshRate : 0, effectiveFps(app->cfg), app->cfg.vsync ? "on" : "off",
+           app->cfg.qualityMode.c_str());
     invalidateQuality(app);
     // Where the frame time actually goes; makes "is it us or the compositor?" an answered question.
     double accPoll = 0, accPrep = 0;
     double accWait = 0, accAcquire = 0, accRecord = 0, accSubmit = 0, accPresent = 0;
-    uint64_t idleSkips = 0, resizeSkips = 0, totalFrames = 0;
+    uint64_t idleSkips = 0, resizeSkips = 0, totalFrames = 0, dtLate = 0;
+    float dtMin = 1e9f, dtMax = 0.f, dtSum = 0.f;
     using clk = std::chrono::high_resolution_clock;
     clk::time_point t0 = clk::now();
     auto lap = [&t0]() {
@@ -677,8 +753,11 @@ int runWindowed(App* app) {
         escWasDown = esc;
         if (app->autoExitSeconds > 0.0 && glfwGetTime() - startT > app->autoExitSeconds) {
             double el = glfwGetTime() - startT;
-            logMsg("auto-exit after %.1f s: %llu frames (%.1f fps average)\n", el,
-                   (unsigned long long)totalFrames, double(totalFrames) / el);
+            logMsg("auto-exit after %.1f s: %llu frames (%.1f fps average) | frame interval "
+                   "%.1f..%.1f ms, mean %.1f, %llu over 20 ms\n",
+                   el, (unsigned long long)totalFrames, double(totalFrames) / el, dtMin * 1000.0,
+                   dtMax * 1000.0, totalFrames ? 1000.0 * dtSum / double(totalFrames) : 0.0,
+                   (unsigned long long)dtLate);
             break;
         }
 
@@ -701,6 +780,15 @@ int runWindowed(App* app) {
         last = now;
         if (dt > 0.1f) dt = 0.1f;
         app->simTime += dt;
+        // Smooth motion needs more than a good average: a stray 33 ms interval between two 16 ms
+        // ones is exactly what the eye reads as a stutter, so the spread is tracked, not the mean.
+        if (dt < dtMin) dtMin = dt;
+        if (dt > dtMax) dtMax = dt;
+        if (dt > 0.020f) ++dtLate;
+        const double dtMs = dt * 1000.0;
+        if (dtMs >= 1.0 && dtMs < 72.0) ++app->dtBins[uint32_t(dtMs)];
+        ++app->framesWindow;
+        dtSum += dt;
 
         int cap = std::max(1, app->cfg.accumulationFrames);
         // The camera orbits, so every presented frame is a new image: we trace each frame and only

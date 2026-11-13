@@ -309,6 +309,8 @@ bool SceneConfig::applyJson(const JsonValue& root, std::string* warn) {
     if (samplesPerFrame < 1) samplesPerFrame = 1;
     if (samplesPerFrame > 4) samplesPerFrame = 4;
     autoQuality = root.booleanAt("autoQuality", autoQuality);
+    vsync = root.booleanAt("vsync", vsync);
+    qualityMode = root.text("qualityMode", qualityMode);
     targetFps = float(root.num("targetFps", targetFps));
     if (targetFps < 20.f) targetFps = 20.f;
     if (targetFps > 240.f) targetFps = 240.f;

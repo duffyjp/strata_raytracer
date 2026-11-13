@@ -177,7 +177,7 @@
   "samplesPerFrame": 1,
   "autoQuality": true,
   "targetFps": 60.0,
-  "qualityHeadroom": 0.26,
+  "qualityHeadroom": 0.3,
   "maxSamplesPerFrame": 16,
   "minRenderScale": 0.4,
   "baseSamplesPerFrame": 4,

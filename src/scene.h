@@ -123,8 +123,12 @@ struct SceneConfig {
     float qualityHeadroom = 0.26f;   // fraction of the frame left unused, for consistent pacing
     int maxSamplesPerFrame = 16;
     float minRenderScale = 0.4f;
-    // Quality is bought in that order: samples up to baseSamplesPerFrame, then supersampling up to
-    // maxRenderScale, then samples again up to maxSamplesPerFrame.
+    // Presentation and burden. vsync is on by default (FIFO): without it the loop renders as fast as
+    // it can and tears. qualityMode bundles the burden limits so there is one knob to turn when the
+    // frame budget cannot be met comfortably: high, balanced, performance or off (no adapting).
+    bool vsync = true;
+    std::string qualityMode = "high";
+    float detectedRefresh = 0.f;   // read from the monitor at startup; 0 means fall back to targetFps
     int baseSamplesPerFrame = 4;
     float maxRenderScale = 2.0f;
     // Hard ceiling on the trace target, so a supersampled 8K window cannot exhaust video memory.

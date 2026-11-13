@@ -26,6 +26,10 @@ static void printHelp() {
         "  --pak FILE           asset archive to load instead of searching\n"
         "  --scale F            trace resolution ceiling (0.4 .. 1.0)            [1.0]\n"
         "  --no-auto-quality    pin samples/pixel and scale instead of adapting to the GPU\n"
+        "  --quality MODE       burden ceiling: high | balanced | performance | off  [high]\n"
+        "                         balanced caps supersampling at 1.25x, performance at 1.0x\n"
+        "  --no-vsync           present without waiting for the display (mailbox/immediate)\n"
+        "  --refresh N          treat the panel as running at N Hz (detected automatically)\n"
         "  --target-fps N       frame rate the adaptive controller aims for       [60]\n"
         "  --max-spp N          most samples per pixel per frame it may spend     [8]\n"
         "  --min-scale F        smallest trace resolution it may fall back to     [0.40]\n"
@@ -47,6 +51,9 @@ static int realMain(int argc, char** argv) {
     bool cliAutoQuality = true, cliAutoGiven = false;
     float cliTargetFps = 0.f, cliMinScale = 0.f;
     int cliMaxSpp = 0;
+    bool cliVsync = true;
+    float cliRefresh = 0.f;
+    std::string cliQuality;
 
     // A GUI-subsystem process has no console unless it is started from one, so mirror everything
     // to a log file next to the executable.
@@ -82,6 +89,9 @@ static int realMain(int argc, char** argv) {
         } else if (a == "--no-auto-quality") { cliAutoQuality = false; cliAutoGiven = true; }
         else if (a == "--target-fps") { cliTargetFps = float(atof(next("--target-fps"))); }
         else if (a == "--max-spp") { cliMaxSpp = atoi(next("--max-spp")); }
+        else if (a == "--no-vsync") { cliVsync = false; }
+        else if (a == "--quality") { cliQuality = next("--quality"); }
+        else if (a == "--refresh") { cliRefresh = float(atof(next("--refresh"))); }
         else if (a == "--min-scale") { cliMinScale = float(atof(next("--min-scale"))); } else if (a == "--compute") forceCompute = true;
         else if (a == "--rt") requireRt = true;
         else if (a == "--verbose" || a == "-v") app.verbose = true;
@@ -97,6 +107,9 @@ static int realMain(int argc, char** argv) {
     if (cliAutoGiven) app.cfg.autoQuality = cliAutoQuality;
     if (cliTargetFps > 0.f) app.cfg.targetFps = cliTargetFps;
     if (cliMaxSpp > 0) app.cfg.maxSamplesPerFrame = cliMaxSpp;
+    if (!cliVsync) app.cfg.vsync = false;
+    if (!cliQuality.empty()) app.cfg.qualityMode = cliQuality;
+    if (cliRefresh > 0.f) app.cfg.detectedRefresh = cliRefresh;  // overrides the measured panel rate
     if (cliMinScale > 0.f) app.cfg.minRenderScale = cliMinScale;
 
     // 2. Window (skipped entirely in capture mode).

@@ -62,6 +62,9 @@ Options (all optional):
 | `--accum S` | samples accumulated per still, default 48 |
 | `--size WxH` | capture resolution, default 1280x720 |
 | `--out DIR` | capture output directory, default `captures` |
+| `--quality MODE` | burden ceiling: `high` (2x supersampling), `balanced` (1.25x), `performance` (window size), `off` |
+| `--no-vsync` | present without waiting for the display (mailbox, else immediate). Shows the true render rate; tears |
+| `--refresh N` | treat the panel as running at N Hz. Detected from the monitor at startup and logged |
 | `--scale F` | baseline trace resolution 0.4-1.0; adaptive quality measures against this (1.0 = the window's own size) |
 | `--no-auto-quality` | pin samples and scale instead of adapting to the GPU |
 | `--target-fps N` | frame rate the controller aims for, default 60 |

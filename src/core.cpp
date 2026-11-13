@@ -246,13 +246,9 @@ void endOneTime(App* app, VkCommandBuffer cmd) {
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
     VK_CHECK(vkQueueSubmit(app->queue, 1, &si, VK_NULL_HANDLE));
-    if (app->deferOneTime) {
-        // Deliberately not waiting: everything here runs on one queue in submit order, so the frame
-        // that follows still sees this work completed. Waiting would drain the queue - including the
-        // pending present - and stall the window.
-        app->retiredCmd.push_back(cmd);
-        return;
-    }
+    // Always drain before returning. Submitting this kind of work and carrying on without an
+    // observable completion looked harmless - one queue keeps the order - but the driver faulted at
+    // teardown with the buffers still unreferenced-but-unretired, so the wait stays.
     VK_CHECK(vkQueueWaitIdle(app->queue));
     vkFreeCommandBuffers(app->device, app->cmdPool, 1, &cmd);
 }

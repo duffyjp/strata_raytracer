@@ -126,6 +126,10 @@ vec3 directLighting(HitInfo h, Material m, vec3 wo, vec3 albedo, inout uint stat
     vec3 accum = vec3(0.0);
     float model = m.flags.x;
     if (model > 1.5) return accum;   // glass is handled purely specularly in the transport loop
+    // A near-perfect mirror's specular lobe is a delta: uniform sampling of the light's disc almost
+    // never lands on it, so next-event estimation would return almost nothing while still claiming
+    // the light has been gathered. Leave those lights to the specular path, which sees them exactly.
+    if (model >= 0.5 && m.params.y < 0.06) return accum;
 
     for (int i = 0; i < LIGHT_COUNT; ++i) {
         Light L = scene.lights[i];
@@ -213,7 +217,12 @@ vec3 pathTrace(vec3 origin, vec3 direction, uint state) {
         // object, saturates to white. That is the bright banding people read as the lights painting
         // spirals on the floor. Surfaces that do no next-event estimation (metal, glass) still show
         // the orb directly, and the camera still sees the orbs themselves on the first hit.
-        bool lightAlreadyCounted = (prevModel >= 0.0 && prevModel < 1.5);
+        // Suppressing the emission is only correct where next-event estimation can actually represent
+        // that light. A Lambertian floor can: it gathers the orb explicitly with a shadow ray. A
+        // mirror cannot - a near-zero roughness makes the glossy NEE term a spike that uniform disc
+        // sampling almost never hits - so suppressing there renders the light as a black hole ringed
+        // by the little energy NEE does gather. Only diffuse surfaces suppress.
+        bool lightAlreadyCounted = (prevModel >= 0.0 && prevModel < 0.5);
         if (!lightAlreadyCounted) radiance += throughput * m.emissive.rgb;
         float model = m.flags.x;
         prevModel = model;

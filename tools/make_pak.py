@@ -70,7 +70,7 @@ SCENE_JSON = {
     "accumulationFrames": 1,
     "autoQuality": True,
     "targetFps": 60.0,
-    "qualityHeadroom": 0.26,
+    "qualityHeadroom": 0.30,
     "maxSamplesPerFrame": 16,
     "minRenderScale": 0.40,
     "baseSamplesPerFrame": 4,
