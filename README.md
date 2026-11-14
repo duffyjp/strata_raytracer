@@ -7,7 +7,7 @@ Windows executable, or open the live web build at
 [duffyjp.github.io/strata_raytracer](https://duffyjp.github.io/strata_raytracer/) — the same
 scene and renderer rewritten for WebGPU.
 
-[![The application running](docs/screenshot.png)](docs/output_example.mp4)
+[![The application running — click to open it live in the browser](docs/screenshot.png)](https://duffyjp.github.io/strata_raytracer/)
 
 ## What it is
 
