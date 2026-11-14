@@ -1,0 +1,109 @@
+name: pages
+
+# Deploy the WebGPU path tracer - browser/, plus the asset archive - to GitHub Pages.
+#
+# The site lands at https://duffyjp.github.io/strata_raytracer/, which is a *path prefix*, not a
+# domain root, so every URL in the page is resolved relative to the page itself. That is why the job
+# below can drop the tree anywhere under that prefix and it still finds scene.pak, the WGSL and the
+# textures.
+#
+# BEFORE THE FIRST DEPLOY (Settings -> Pages -> Build and deployment):
+#   Source must be "GitHub Actions", not "Deploy from a branch".
+# If it is still on "Deploy from a branch", actions/deploy-pages fails with
+#   "Pages Not Found: Sorry! Looks like you need to enable GitHub Pages for this repository"
+# (or a 403 on the deployment endpoint), which reads like a permissions bug and is not one - this
+# workflow's permissions block below is already the correct one. The same message also appears if
+# the environment "github-pages" was deleted, so check both in Settings before believing anything else.
+#
+# A repository has exactly ONE Pages site. Whatever this job publishes replaces whatever else
+# published it - so if the release branch has its own Pages job, or a "Deploy from a branch" setting
+# pointing at docs/ or gh-pages, the last deploy wins and the other one silently stops being the live
+# site. That is the intended trade for being able to preview the web build from a feature branch; the
+# other publisher has to be turned off, or this job restricted to one branch, before that surprises
+# anyone.
+
+on:
+  push:
+    # Any branch, as long as the push touches the site, the packer that feeds it, or this file.
+    # Pages has one slot per repository, so the most recent push is the live site - see above.
+    paths:
+      - 'browser/**'
+      - 'tools/make_pak.py'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch: {}
+
+# Required by actions/deploy-pages: contents read (to check out), pages + id-token write (to talk to
+# the deployment API). Narrower than the release workflow's contents: write.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Serialise deployments: two concurrent deploy-pages runs on one site is a race the platform does not
+# resolve nicely. In-progress runs are not cancelled, so a deploy never dies half-published.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      # The web app is static - HTML, JS modules, WGSL - and the only generated input it needs is
+      # scene.pak, which tools/make_pak.py writes from the standard library (json, os, struct, zlib,
+      # zipfile) with no compiler and no Vulkan SDK. That is the whole reason this job can be
+      # ubuntu-latest while the release job stays on windows-latest: nothing here builds raytracer.exe,
+      # and build.ps1 is not called.
+      #
+      # make_pak.py authors its assets into --root/assets/ and then zips them, so on this runner it
+      # writes into the checkout. Nothing is pushed back; the checkout is throwaway.
+      - name: build scene.pak into the staging tree
+        run: |
+          mkdir -p dist/assets
+          python tools/make_pak.py --root . --out dist/assets/scene.pak
+
+      # The site is browser/ as tracked. Alongside it go the loose assets, so that a build without
+      # a pak still finds scene.json and the textures under the same relative paths the page asks for.
+      - name: assemble dist/
+        run: |
+          cp -R browser/. dist/
+          cp assets/scene.json dist/assets/scene.json
+          cp -R assets/textures/. dist/assets/textures/
+          # Anything a local run left inside browser/ is not part of the site. These are named in
+          # .gitignore, so a fresh checkout will not have them; the pruning is here so the job stays
+          # correct if that ever changes, and so the listing below is the truth about what gets
+          # published.
+          rm -rf dist/evidence dist/evidence2 dist/refs dist/results.txt dist/assets/README.txt
+          rm -rf dist/html   # a stale copy of the tree, if anyone ever nested one
+          echo "published files:"
+          find dist -type f | sort
+          echo "site size: $(du -sh dist | cut -f1), $(find dist -type f | wc -l) files"
+          for f in index.html app.js favicon.ico shaders/trace.wgsl assets/scene.pak assets/scene.json \
+                   assets/textures/checker.png assets/textures/emissive_ramp.png; do
+            test -f "dist/$f" || { echo "::error::dist is missing $f - the site would 404 on it"; exit 1; }
+          done
+
+      - name: setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: upload the site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
