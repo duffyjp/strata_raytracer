@@ -310,6 +310,116 @@ async function scenarioKeys() {
 }
 
 /**
+ * Holding a movement key must not spin the view.
+ *
+ * What is measured is `state().view` - the camera basis `setFrame` actually handed the GPU for the
+ * frame just drawn, after the orbit/free-camera blend - and not the free camera's own `yaw`, which
+ * would let a still-yaw pass while the picture turned. The exe's rule (`frame.cpp:1308-1313`,
+ * `core2.cpp:354-375`) is that the blend reaches 1 within about 0.13 s of the first press, and past
+ * blend 1 the orbit contributes nothing to the rendered basis: in the executable the auto-orbit stops
+ * the moment you take control. So the assertion is: while W is held and the blend is 1, the view
+ * direction holds still (to within a fraction of a degree) while the camera position runs away.
+ *
+ * The scene clock is *not* stopped by holding W - on either build. The lights and the emissive orbs
+ * keep their motion while you drive, and `orbitPhase` keeps advancing behind the blend; that is what
+ * makes the eased hand-back land on a live orbit instead of on a frozen one. `P` is what stops the
+ * clock, and the idle timer reads it (`app.js:420`), so `P` freezes the view, the lights and the
+ * 10 s hand-back together, while the frame loop, the fps window and the accumulation counter keep
+ * running - the documented pause semantics.
+ *
+ * @returns {Promise<void>}
+ */
+async function scenarioOrbitHold() {
+  await waitFor('window.__ray && window.__ray.ready', 120000, 'window.__ray');
+  const ang = (a, b) => Math.acos(Math.max(-1, Math.min(1,
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2])));
+  const rad2deg = (r) => (r * 180 / Math.PI);
+
+  // Precondition: with nobody at the wheel the view really does turn, so a later "it did not turn"
+  // cannot be the trivial result of a page that stopped animating.
+  const spin0 = await evaluate('window.__ray.state()');
+  await sleep(600);
+  const spin1 = await evaluate('window.__ray.state()');
+  const orbitRate = ang(spin0.view.forward, spin1.view.forward);
+  check('the orbit turns the view while no key is held', orbitRate > 0.01,
+    `${orbitRate.toFixed(4)} rad in ~0.6 s (orbitPhase ${spin0.orbitPhase} -> ${spin1.orbitPhase})`);
+  await sleep(3500);   // let the controller settle before the measurement below
+
+  // --- hold W across frames the way a hand holds it: one keyDown, samples, one keyUp.
+  const base = { code: 'KeyW', key: 'w', windowsVirtualKeyCode: 87, nativeVirtualKeyCode: 87 };
+  const before = await evaluate('window.__ray.state()');
+  await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base });
+  await send('Input.dispatchKeyEvent', { type: 'char', ...base, text: 'w' });
+  const samples = [];
+  for (let i = 0; i < 10; i++) {
+    await sleep(150);
+    samples.push(await evaluate('window.__ray.state()'));
+  }
+  await send('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
+  const held = samples.filter((s) => s.freeCam);
+  results.orbitHold = samples.map((s) => ({ frame: s.frame, blend: s.blend, simTime: s.simTime,
+    orbitPhase: s.orbitPhase, camPos: s.camPos, yaw: s.yaw, view: s.view }));
+
+  const last = held[held.length - 1];
+  check('W takes the camera and the blend reaches full free look',
+    held.length >= 6 && last.blend >= 0.999,
+    `${held.length} samples free, last blend=${last.blend} camPos=${JSON.stringify(last.camPos)}`);
+  const dist = Math.hypot(last.camPos[0] - before.camPos[0], last.camPos[2] - before.camPos[2]);
+  check('W moves the camera', dist > 0.5, `${dist.toFixed(3)} units while held`);
+  check('frames really advanced while W was held', last.frame > samples[0].frame
+    && last.simTime > samples[0].simTime,
+    `frame ${samples[0].frame} -> ${last.frame}, simTime ${samples[0].simTime} -> ${last.simTime}`);
+  check('the orbit phase keeps running behind the blend (the clock is not what holding W stops)',
+    last.orbitPhase !== samples[0].orbitPhase || last.simTime > samples[0].simTime,
+    `orbitPhase ${samples[0].orbitPhase} -> ${last.orbitPhase}`);
+
+  // The bug's signature, measured on the rendered basis.
+  const full = held.filter((s) => s.blend >= 0.999);
+  let stepMax = 0;
+  for (let i = 1; i < full.length; i++) stepMax = Math.max(stepMax, ang(full[i - 1].view.forward, full[i].view.forward));
+  const total = full.length > 1 ? ang(full[0].view.forward, full[full.length - 1].view.forward) : 0;
+  check('while W is held the view direction does not advance with the orbit',
+    full.length >= 5 && stepMax < 0.002,
+    `worst frame-to-frame turn ${stepMax.toFixed(5)} rad (${rad2deg(stepMax).toFixed(3)} deg) over ` +
+    `${full.length} full-blend samples, total ${total.toFixed(5)} rad, ` +
+    `forward ${JSON.stringify(full[0].view.forward)} -> ${JSON.stringify(full[full.length - 1].view.forward)}`);
+  check('and at full blend the rendered camera is the free camera, not the orbit',
+    (() => {
+      const v = last.view.origin, p = last.camPos;
+      const d = Math.hypot(v[0] - p[0], v[1] - p[1], v[2] - p[2]);
+      results.renderedOriginVsCamPos = +d.toFixed(4);
+      return d < 0.05;
+    })(),
+    `rendered origin ${JSON.stringify(last.view.origin)} vs free camPos ${JSON.stringify(last.camPos)} ` +
+    `(${results.renderedOriginVsCamPos} apart - a gap means the orbit is still contributing)`);
+
+  // --- the ten-second idle hand-back, and it has to be eased rather than a snap.
+  const t0 = Date.now();
+  await waitFor('window.__ray.state().freeCam === false ? true : null', 25000,
+    'the camera to be handed back after idling', 250);
+  const idleMs = Date.now() - t0;
+  const handed = await evaluate('window.__ray.state()');
+  check('releasing the keys hands control back after the idle interval',
+    handed.freeCam === false && idleMs < 12500, `freeCam=${handed.freeCam} after ${idleMs} ms`);
+  const eases = [];
+  for (let i = 0; i < 14; i++) {
+    await sleep(150);
+    eases.push(await evaluate('window.__ray.state()'));
+  }
+  results.handBack = eases.map((s) => ({ frame: s.frame, blend: s.blend, view: s.view }));
+  const mid = eases.filter((s) => s.blend > 0.05 && s.blend < 0.95);
+  const monotone = eases.every((s, i) => i === 0 || s.blend <= eases[i - 1].blend + 1e-9);
+  check('the hand-back eases through intermediate blends (it does not snap)',
+    monotone && mid.length >= 4,
+    `blends ${eases.map((s) => s.blend.toFixed(2)).join(' ')} - ${mid.length} intermediate`);
+  const end = eases[eases.length - 1];
+  const resumed = ang(eases[Math.max(0, eases.length - 2)].view.forward, end.view.forward);
+  check('and once blend is 0 the view is back on the orbit, turning again',
+    end.blend <= 0.001 && resumed > 0.005,
+    `blend=${end.blend}, view turned ${resumed.toFixed(5)} rad in one sample (~150 ms) at the end`);
+}
+
+/**
  * Alt+Enter on its own, in a separate run: the browser's own Escape handling would otherwise be in
  * the way, and the answer this records is what the browser permitted rather than what the app asked
  * for. Headless Edge reports a virtual 800x600 screen, which is also why the size in the log line is
@@ -746,7 +856,7 @@ async function scenarioPin() {
 const SCENARIOS = { smoke: scenarioSmoke, keys: scenarioKeys, resize: scenarioResize,
   still: scenarioStill, adaptive: scenarioAdaptive, probe: scenarioProbe,
   fullscreen: scenarioFullscreen, mouse: scenarioMouse,
-  features: scenarioFeatures, pin: scenarioPin };
+  features: scenarioFeatures, pin: scenarioPin, orbitHold: scenarioOrbitHold };
 
 // --------------------------------------------------------------------------- what the page fetched
 /**

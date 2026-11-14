@@ -1731,6 +1731,14 @@ function api() {
       paused: run.paused, frozen: run.frozen, accum: run.samplesAccumulated,
       camPos: run.camPos.map((v) => +v.toFixed(3)), yaw: +run.yaw.toFixed(4),
       pitch: +run.pitch.toFixed(4), pointerLocked: run.pointerLocked,
+      // What the eye actually sees, as opposed to the free camera's own numbers above: the basis
+      // writeParams handed to the GPU for the frame just drawn, after the orbit/free blend (app.js
+      // setFrame stores it in renderer.prevBasis). `orbitPhase` is the orbit angle that produced it.
+      view: renderer && renderer.prevBasis ? {
+        origin: renderer.prevBasis.origin.map((v) => +v.toFixed(5)),
+        forward: renderer.prevBasis.forward.map((v) => +v.toFixed(5)),
+      } : null,
+      orbitPhase: +((run.simTime * cfg.camera.speed) % (Math.PI * 2)).toFixed(5),
     lockRefused: run.lockRefused, mouseLookMode: args.mouseLook,
       denoise: quality.denoise, denoiseUserToggled: run.denoiseUserToggled,
       spp: liveSpp(), sppUserToggled: run.sppUserToggled, sppMax: sppMax(),
