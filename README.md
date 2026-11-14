@@ -2,7 +2,10 @@
 
 A real-time path tracer that runs from a single 800 KB executable. Vulkan ray tracing, no
 installer, no runtime dependencies beyond a Vulkan driver, and nothing to install — the
-assets ship in one `.pak` beside the binary.
+assets ship in one `.pak` beside the binary. There are two ways to run it: download the
+Windows executable, or open the live web build at
+[duffyjp.github.io/strata_raytracer](https://duffyjp.github.io/strata_raytracer/) — the same
+scene and renderer rewritten for WebGPU.
 
 [![The application running](docs/screenshot.png)](docs/output_example.mp4)
 
@@ -68,6 +71,44 @@ program has no console when started from Explorer. `--help` lists the options, i
 `--capture N` for headless stills and `--list-adapters`, which prints what the machine
 actually supports and why a GPU was accepted or skipped.
 
+## In the browser
+
+**Best experienced in a Chrome-based browser**, Edge or Chrome. On the same machine in the
+same minute the identical page measured **9.32 ms per frame in Edge against 99.11 ms in
+Firefox**, and a fixed calibration kernel measured **894.78 GFLOP/s in Edge against
+21.47 GFLOP/s in Firefox** — a factor of 42. Firefox also cannot report its adapter
+identity from web content, so a Firefox run cannot even be attributed to a GPU.
+
+**Why the browser build is slower:** WebGPU has no ray tracing at all — no acceleration
+structures and no ray queries — so the trace is a compute kernel traversing a
+bounding-volume hierarchy built on the CPU. That costs roughly **two and a half to three
+times as much per pixel per sample** as the hardware path the executable uses.
+
+**What to expect visually:** the adaptive controller targets 60 fps by reducing render
+resolution first and keeping the denoiser, so the picture can look softer than the desktop
+app at the same window size. That is deliberate, not broken. On an RTX-class card it
+settles around 0.5–0.85 scale at 60 fps with the filter on, and the on-screen overlay
+reports the scale and sample count it chose.
+
+**Keep the tab visible and in the foreground.** A hidden or occluded tab is throttled, and
+in one recorded run every single pass measured exactly 33.33 ms — one thirtieth of a second,
+six different kernels, an identical number — which is a throttle quantum, not a measurement.
+Any timings taken from a backgrounded page are meaningless.
+
+**Keys:** the executable's, plus `P` to pause — which freezes scene time while
+accumulation continues, so the image converges to a clean still rather than freezing as a
+noisy frame — and `Up`/`Down` to set samples per pixel, which pins that choice so the
+controller stops touching it and keeps owning resolution and the filter. `N` still toggles
+the denoiser and overrides the controller for the run. `WASD` free camera with the
+ten-second idle return to the orbit, `Alt+Enter` fullscreen, `ESC` stops rendering. A
+status overlay in the top-left mirrors the desktop title-bar text, and the browser console
+carries the same log the executable writes to `raytracer.log`.
+
+One deliberate difference from the desktop controller: the browser gives up resolution
+before it gives up the denoiser, the opposite of the executable's tested priority, because
+on this path the filter can cost around a hundred times more per megapixel than it does
+natively.
+
 ## Requirements
 
 Vulkan 1.3 with `VK_KHR_acceleration_structure`, `VK_KHR_ray_tracing_pipeline` and
@@ -78,6 +119,9 @@ Tested on a modern **Nvidia Blackwell GPU** and a **GTX 1080 Ti** — the latter
 advertises the ray-tracing pipeline but not ray queries, and runs the RT path happily. Not
 tested on AMD or Intel hardware that does have ray tracing; the Intel GPU in the development
 machine correctly reports itself unusable for both paths and is skipped.
+
+The web build needs a browser with WebGPU enabled — Edge or Chrome — on a GPU the browser
+will actually hand the page. It needs no Vulkan driver and nothing to download.
 
 ## Building it
 
