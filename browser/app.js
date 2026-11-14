@@ -272,14 +272,23 @@ function frameBasis(t, w, h) {
   run.orbitF = orbit.forward.slice();
   const blend = run.camBlend;
   if (blend <= 0.0005) return orbit;
-  // core2.cpp:351-375: interpolate the origin and the forward, then RE-DERIVE right and up from the
-  // blended forward. Lerping a basis shears the picture halfway through the handover.
+  // core2.cpp:354-375: the ORBIT basis is the starting point and the free camera is what it is
+  // blended TOWARD, so blend 0 is "the orbit, entirely" and blend 1 "the free camera, entirely".
   const cp = Math.cos(run.pitch);
-  let f = [Math.sin(run.yaw) * cp, Math.sin(run.pitch), Math.cos(run.yaw) * cp];
-  const fl = Math.hypot(...f);
-  f = fl > 1e-6 ? f.map((v) => v / fl) : f;
+  let ff = [Math.sin(run.yaw) * cp, Math.sin(run.pitch), Math.cos(run.yaw) * cp];
+  const fl = Math.hypot(...ff);
+  ff = fl > 1e-6 ? ff.map((v) => v / fl) : ff;
+  // The origin and the forward have to be blended in the same direction. Reading the exe's
+  // `f[i] += (ff[i] - f[i]) * blend` the other way round - starting at the free forward and easing
+  // toward orbit.forward - leaves the orbit's own direction as the rendered view once the blend is
+  // full, so the camera translated where you steered it while still looking along a line that went
+  // on orbiting: measured at 2.206 deg of turn per frame with W held (tools/run_page.mjs
+  // --scenario orbitHold), easing to nothing the moment the two directions agree. The origin was
+  // already blended the right way, which is why the position moved as asked and only the view lied.
   const o = orbit.origin.map((v, i) => v + (run.camPos[i] - v) * blend);
-  f = f.map((v, i) => v + (orbit.forward[i] - v) * blend);
+  let f = orbit.forward.map((v, i) => v + (ff[i] - v) * blend);
+  // core2.cpp:366-374: RE-DERIVE right and up from the blended forward, rather than interpolating
+  // them. Lerping a basis shears the picture halfway through the handover.
   const fl2 = Math.hypot(...f);
   if (fl2 > 1e-6) f = f.map((v) => v / fl2);
   let r = [-f[2], 0, f[0]];
