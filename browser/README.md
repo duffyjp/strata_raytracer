@@ -545,3 +545,57 @@ desktop app's GPU timestamps do not.
   It changes nothing while the controller is exhausted (no further moves are made), but it is the
   ported controller's own behaviour and it is recorded here rather than smoothed out of the report.
 
+### 10.3 The bug the `orbitHold` scenario exists for: driving while the view kept orbiting
+
+Holding `W` translated the camera and the picture went on turning. §2's `W` row claimed parity, and the
+`keys` scenario agreed with it, because the check it makes - "W changes the camera position" - reads
+`state().camPos`, the free camera's own numbers, and those were right. What the eye sees is the basis
+`setFrame` hands the GPU, and that was being built wrong: `frameBasis()` eased **origin** from the orbit
+toward `camPos`, and **forward** from the free camera toward `orbit.forward`. One line each, opposite
+directions. `core2.cpp:354-363` starts both halves at the orbit and eases them toward the free camera, so
+past a full blend the orbit contributes nothing at all and the auto-orbit is, observably, stopped; on the
+port the blend reaching 1 made the rendered view direction exactly `orbit.forward` - the free camera's
+direction multiplied out to nothing - so the camera drove where it was steered while looking along a line
+that kept orbiting.
+
+Fixed, and now measured on the rendered basis rather than on the free camera's (`tools/run_page.mjs
+--scenario orbitHold`, trusted `Input.dispatchKeyEvent`, `state().view` read straight out of
+`renderer.prevBasis`, which is the basis the last frame was drawn with):
+
+| measurement, while `W` is held across 10 samples at full blend | before the fix | after |
+|---|---|---|
+| worst frame-to-frame turn of the rendered view direction | **0.03850 rad (2.206 deg)** | **0.00000 rad** |
+| total turn across the held stretch | **0.33270 rad (19.1 deg)** | **0.00000 rad** |
+| distance the camera travelled | 3.033 units | 3.215 units |
+| rendered origin vs the free camera's `camPos` | 0.0006 apart | 0.0004 apart |
+| frames advanced while held (proof it is not a stopped page) | 273 -> 360 | 261 -> 349 |
+| the orbit's own phase behind the blend | still running | still running |
+
+The last row is the deliberate part of the design and it is the exe's design: the orbit angle is not
+frozen by taking control, it is *overridden*, because the blend makes it contribute nothing. One clock
+(`run.simTime`) drives the orbit angle, both light orbits and the orb refit, so freezing it to stop the
+camera would stop the lights too - which the exe does not do - and the eased hand-back is written to land
+on a live orbit rather than on a stalled one. "While the user has control the orbit must not advance at
+all" is therefore enforced on what is rendered: at full blend the view direction is the player's to the
+last digit, and the only thing that moves the camera is the mouse.
+
+What the same run also re-proved, unchanged by the fix: the hand-back still fires at 10 s of no WASD
+(10.15 s measured) and eases down through **0.78 0.67 0.56 0.45 0.34 0.23 0.12 0.01** rather than
+snapping, with the view turning at orbit rate again once `blend` reaches 0 (0.03666 rad in one 150 ms
+sample). The two clocks this touches are the two §2.1 already decided, and this fix does not move them.
+**The orbit runs on scene time** (`run.simTime`, which is what `P` stops), as the exe's orbit runs on the
+loop's `t`, and as the two light orbits and the orb refit do beside it. **The idle timer counts wall
+time** (`nowS()` - `run.lastWasd`, the web reading of the exe's `glfwGetTime()` - `lastWasd`), and both
+that check and the blend's easing step are skipped while paused (`app.js:420`, `app.js:430`) - so ten
+seconds spent paused do not spend the idle allowance, and a `P` taken mid-handover freezes the camera
+where it is instead of letting it drift toward the orbit. The exe cannot contradict either half: it has
+no pause, and there its `t` and its `glfwGetTime()` are the same clock.
+
+`--scenario keys` (14 checks), `--scenario still` (`correctness_failures_still=0`,
+`correctness_verdict_still=pipeline_matches_native`, `gpu_errors=0`, evidence PNG re-written at
+`45FFAF48…`, byte-identical to the still this build produced before the change - as expected, since
+`?capture` renders at blend 0 and never touches the path that was wrong) and the native regression
+(`build.ps1` exit 0, `ninja: no work to do`, `raytracer.exe --autoexit 6` exit 0 at **58.9 fps**) all
+still pass, with `git diff --name-only bc2c422..HEAD -- src shaders tools build.ps1 CMakeLists.txt`
+empty.
+
